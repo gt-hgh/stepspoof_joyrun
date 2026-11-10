@@ -1,0 +1,17 @@
+#!/sbin/sh
+# Magisk / KernelSU 模块安装脚本（仅解包，逻辑极简）
+
+umask 022
+SKIPUNZIP=1
+
+ui_print "- 安装 闪动校园 传感器控制（方案B）"
+
+unzip -o "$ZIPFILE" 'module.prop' -d "$MODPATH" >/dev/null 2>&1
+unzip -o "$ZIPFILE" 'zygisk/*'   -d "$MODPATH" >/dev/null 2>&1
+unzip -o "$ZIPFILE" 'webroot/*'  -d "$MODPATH" >/dev/null 2>&1
+
+chmod -R 0755 "$MODPATH"
+find "$MODPATH" -type f -exec chmod 0644 {} \; 2>/dev/null
+[ -f "$MODPATH/module.prop" ] || abort "! module.prop 缺失"
+
+ui_print "- 安装完成，重启后生效"

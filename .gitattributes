@@ -1,0 +1,23 @@
+# 默认：自动换行
+* text=auto
+
+# Shell 脚本 / Android 安装脚本必须保持 LF（在 Android/Linux 上执行）
+*.sh text eol=lf
+META-INF/com/google/android/update-binary text eol=lf
+META-INF/com/google/android/updater-script text eol=lf
+
+# C/C++ 源码：统一 LF
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.h   text eol=lf
+*.mk  text eol=lf
+
+# Web
+*.html text eol=lf
+*.js   text eol=lf
+*.css  text eol=lf
+
+# 二进制，不做换行处理
+*.so   binary
+*.zip  binary
+*.o    binary
