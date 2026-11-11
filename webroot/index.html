@@ -100,6 +100,23 @@
     }
     .toast.show{transform:translateX(-50%) translateY(0)}
     .footer{text-align:center;padding:8px 0 28px;font-size:11px;opacity:.35}
+    .log-path{
+      font-family:ui-monospace,Menlo,monospace;font-size:11.5px;
+      background:rgba(0,0,0,.28);border-radius:10px;
+      padding:10px 12px;word-break:break-all;line-height:1.5;
+      margin-bottom:12px;color:rgba(200,225,255,.9);
+    }
+    .log-meta{font-size:12px;opacity:.6;margin-bottom:14px}
+    .btn-row{display:flex;gap:10px}
+    .btn-mini{
+      flex:1;padding:12px 8px;border:none;border-radius:11px;
+      font-size:13.5px;font-weight:600;cursor:pointer;
+      background:rgba(255,255,255,.16);color:#fff;
+      transition:.2s;
+    }
+    .btn-mini:active{transform:scale(.97);background:rgba(255,255,255,.26)}
+    .btn-mini.warn{background:rgba(255,120,120,.22);color:#ffd7d7}
+    .btn-mini:disabled{opacity:.4}
   </style>
 </head>
 <body>
@@ -181,7 +198,19 @@
   <div class="hint">STD/STC 仅在 App 注册硬件计步器时才会计数。闪动校园用 400Hz 加速度自算步数，这两项恒为 0 属正常现象，看「加速度事件」即可。</div>
 </div>
 
-<div class="footer">stepspoof_joyrun v1.1.8</div>
+<div class="card">
+  <div class="card-label">运行日志</div>
+  <div class="log-path" id="logPath">/sdcard/Download/stepspoof_joyrun.log</div>
+  <div class="log-meta" id="logMeta">等待模块启动…</div>
+  <div class="btn-row">
+    <button class="btn-mini" id="btnMark">打标记</button>
+    <button class="btn-mini" id="btnCopyLog">复制日志</button>
+    <button class="btn-mini warn" id="btnClearLog">清空</button>
+  </div>
+  <div class="hint">日志同时写入 logcat 与上述文件，超过 2MB 自动轮转为 .old。手机自带文件管理器打开「下载」目录即可找到，无需电脑。排障时先点「打标记」，再复现问题，最后把文件发出来。</div>
+</div>
+
+<div class="footer">stepspoof_joyrun v1.2.0</div>
 <div class="toast" id="toast"></div>
 
 <script>
@@ -403,6 +432,86 @@ document.getElementById('btnSim').addEventListener('click',async function(){
 /* 每 3 秒同步 */
 setInterval(load,3000);
 window.addEventListener('DOMContentLoaded',load);
+
+/* ── 日志面板 ── */
+function fmtSize(n){
+  if(!n && n!==0) return '—';
+  if(n < 1024) return n + ' B';
+  if(n < 1024*1024) return (n/1024).toFixed(1) + ' KB';
+  return (n/1024/1024).toFixed(2) + ' MB';
+}
+
+async function refreshLogInfo(){
+  const p = document.getElementById('logPath');
+  const m = document.getElementById('logMeta');
+  if(!p || !m) return;
+  // 模块在线时读接口；离线时用 root shell 直接 stat 推测路径
+  try{
+    const st = await api('/api/log');
+    if(st && st.path){
+      p.textContent = st.path;
+      m.textContent = st.exists
+        ? ('文件已生成 · ' + fmtSize(st.size) + ' · 超过 2MB 自动轮转为 .old')
+        : '模块在线，但日志文件尚未生成（等 App 产生一次日志）';
+      return;
+    }
+  }catch(e){}
+
+  const guess = '/sdcard/Download/stepspoof_joyrun.log';
+  p.textContent = guess;
+  const sz = await sh('[ -f '+guess+' ] && stat -c %s '+guess+' 2>/dev/null || echo 0');
+  const n = parseInt((sz||'0').trim()) || 0;
+  m.textContent = n > 0
+    ? ('文件已生成 · ' + fmtSize(n) + '（模块未运行，数据为上一次运行残留）')
+    : '模块未运行，日志文件尚未生成';
+}
+
+document.getElementById('btnMark').addEventListener('click', async function(){
+  try{
+    await api('/api/log/mark', {});
+    toast('已写入标记行');
+  }catch(e){
+    // 模块离线时退化为 root 直接追加
+    await sh("echo '== user marked (WebUI) ==' >> /sdcard/Download/stepspoof_joyrun.log 2>/dev/null");
+    toast('已写入标记行');
+  }
+});
+
+document.getElementById('btnCopyLog').addEventListener('click', async function(){
+  const path = document.getElementById('logPath').textContent.trim();
+  const txt = await sh('tail -c 200000 "'+path+'" 2>/dev/null');
+  if(!txt || !txt.trim()){ toast('日志为空或读取失败'); return; }
+  try{
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      await navigator.clipboard.writeText(txt);
+      toast('已复制最近 200KB');
+    }else{
+      const ta=document.createElement('textarea');
+      ta.value=txt; document.body.appendChild(ta); ta.select();
+      document.execCommand('copy'); document.body.removeChild(ta);
+      toast('已复制最近 200KB');
+    }
+  }catch(e){
+    // 剪贴板不可用时落一份 txt 到 Download
+    const b = b64(txt);
+    await sh("echo '"+b+"' | base64 -d > /sdcard/Download/stepspoof_log_copy.txt 2>/dev/null");
+    toast('已另存为 stepspoof_log_copy.txt');
+  }
+});
+
+document.getElementById('btnClearLog').addEventListener('click', async function(){
+  try{
+    await api('/api/log/clear', {});
+  }catch(e){
+    await sh('rm -f /sdcard/Download/stepspoof_joyrun.log /sdcard/Download/stepspoof_joyrun.log.old 2>/dev/null');
+  }
+  toast('日志已清空');
+  await refreshLogInfo();
+});
+
+/* 日志信息 10 秒刷新一次（比状态轮询慢，减少 root shell 调用） */
+setInterval(refreshLogInfo, 10000);
+window.addEventListener('DOMContentLoaded',refreshLogInfo);
 </script>
 </body>
 </html>

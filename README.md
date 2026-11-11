@@ -28,8 +28,25 @@ KernelSU Manager → 模块 → 打开 WebUI。
 
 设置步频区间（如 172–182 spm），点击开始仿真，随后正常跑步即可。
 
+## 日志
+
+模块运行日志同时写入 logcat 和文件，默认路径：
+
+```
+/sdcard/Download/stepspoof_joyrun.log
+```
+
+手机文件管理器打开「下载」目录即可取到，不需要电脑。超过 2MB 自动轮转为 `.old`。`/sdcard` 不可写时降级到 `/data/data/com.huachenjie.shandong_school/files/stepspoof.log`。
+
+WebUI 底部「运行日志」卡片显示实际路径与大小，提供三个按钮：打标记（在日志里插一行方便定位）、复制日志（最近 200KB）、清空。
+
+排障流程：点「打标记」→ 复现问题 → 点「复制日志」或直接取文件。
+
+需要电脑时：
+
 ```bash
-adb logcat -s stepspoof   # 验证 hook 状态
+adb logcat -s stepspoof              # 实时看
+adb pull /sdcard/Download/stepspoof_joyrun.log
 ```
 
 ## 兼容
@@ -40,6 +57,7 @@ adb logcat -s stepspoof   # 验证 hook 状态
 
 ## 更新
 
+- **v1.2.0** 新增运行日志落盘（默认下载目录）；WebUI 加日志卡片
 - **v1.1.8** 整理代码
 - **v1.1.7** 波形替换；新增步长与配速
 - **v1.1.5** 多槽位 hook；修复 WebUI 混合内容拦截

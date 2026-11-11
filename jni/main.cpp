@@ -1,12 +1,14 @@
-// stepspoof_joyrun v1.1.7 — 纯 native Zygisk 模块
+// stepspoof_joyrun v1.2.0 — 纯 native Zygisk 模块
 // 目标：com.huachenjie.shandong_school（闪动校园）
 // 功能：
 //   1) 加速度波形仿真（FuckRun 设计：X=0, Y=1.5·cos, Z=9.81+3.5·sin）
 //      驱动 App 自研带通滤波计步算法（h9.d）产生步数
 //   2) STEP_COUNTER / STEP_DETECTOR 事件改写（App 注册硬件计步器时生效）
 //   3) 步频仿真线程：在 [min, max] 区间随机锁定步频，整段稳定不抖动
-//   4) 本地 HTTP API（127.0.0.1:8888）供 KSU WebUI 通过 root shell nc 访问
-//   5) conf_watch_loop：轮询 App 私有目录 stepspoof.conf，断连后持久化生效
+//   4) 运行日志：同时写 logcat 与 /sdcard/Download/stepspoof_joyrun.log
+//      （2MB 自动轮转到 .old；/sdcard 不可写时降级到 App 私有目录）
+//   5) 本地 HTTP API（127.0.0.1:8888）供 KSU WebUI 通过 root shell nc 访问
+//   6) conf_watch_loop：轮询 App 私有目录 stepspoof.conf，断连后持久化生效
 // 不依赖 LSPosed / 不建 ClassLoader / 不加载内存 dex。
 //
 // Hook 路径：
@@ -23,6 +25,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cmath>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -36,6 +39,7 @@
 #include <arpa/inet.h>
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <malloc.h>
 #include <netinet/in.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -44,12 +48,133 @@
 #include <unistd.h>
 
 #define LOG_TAG "stepspoof"
-#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
+// 目标包名（日志降级路径、控制通道路径都依赖它，必须在最前定义）
 #define TARGET_PKG_STR "com.huachenjie.shandong_school"
+
+// ---------------------------------------------------------------------------
+// 日志：同时输出到 logcat 与文件
+// 文件路径 /sdcard/Download/stepspoof_joyrun.log（v1.2.0 起）
+// 这样用户不用 adb 也能直接拿到日志。写失败时自动降级到 App 私有目录。
+// ---------------------------------------------------------------------------
+static int g_log_fd = -1;
+static long long g_log_bytes = 0;
+static constexpr long long kLogMaxBytes = 2 * 1024 * 1024;   // 2MB 自动轮转
+
+// 由 log_open() 在首次写入时确定实际可用路径
+static char g_log_path[256] = {0};
+
+static void log_open() {
+    if (g_log_fd >= 0) return;
+
+    // App 进程的 uid 对 /sdcard 需要经 MediaProvider 授权，直接用 open 常失败；
+    // 先试 /sdcard/Download（多数 ROM 对 app 域已放宽），失败再试私有目录。
+    const char *cands[] = {
+        "/sdcard/Download/stepspoof_joyrun.log",
+        "/storage/emulated/0/Download/stepspoof_joyrun.log",
+        "/storage/self/primary/Download/stepspoof_joyrun.log",
+    };
+    for (const char *p : cands) {
+        int fd = open(p, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+        if (fd >= 0) {
+            g_log_fd = fd;
+            strncpy(g_log_path, p, sizeof(g_log_path) - 1);
+            g_log_path[sizeof(g_log_path) - 1] = 0;
+            struct stat st {};
+            if (fstat(fd, &st) == 0) g_log_bytes = (long long)st.st_size;
+            return;
+        }
+    }
+
+    // 兜底：App 私有目录（root 与 App 自身都可读，用户可用文件管理器 root 模式取）
+    char fallback[256];
+    snprintf(fallback, sizeof(fallback),
+             "/data/data/%s/files/stepspoof.log", TARGET_PKG_STR);
+    int fd = open(fallback, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
+    if (fd >= 0) {
+        g_log_fd = fd;
+        strncpy(g_log_path, fallback, sizeof(g_log_path) - 1);
+        g_log_path[sizeof(g_log_path) - 1] = 0;
+        struct stat st {};
+        if (fstat(fd, &st) == 0) g_log_bytes = (long long)st.st_size;
+    }
+}
+
+static void log_close_and_rotate_if_needed() {
+    if (g_log_fd < 0) return;
+    if (g_log_bytes < kLogMaxBytes) return;
+
+    close(g_log_fd);
+    g_log_fd = -1;
+    g_log_bytes = 0;
+
+    // 轮转：把当前文件改名成 .old，再重新打开新建
+    char old_path[300];
+    snprintf(old_path, sizeof(old_path), "%s.old", g_log_path);
+    rename(g_log_path, old_path);
+    log_open();
+}
+
+// 统一写入：logcat + 文件
+static void log_v(int prio, const char *fmt, va_list ap) {
+    // 1) logcat
+    va_list ap2;
+    va_copy(ap2, ap);
+    __android_log_vprint(prio, LOG_TAG, fmt, ap2);
+    va_end(ap2);
+
+    // 2) 文件
+    log_open();
+    if (g_log_fd < 0) return;
+
+    char line[1024];
+    char stamp[32];
+    struct timespec ts {};
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tmv {};
+    time_t sec = ts.tv_sec;
+    localtime_r(&sec, &tmv);
+    snprintf(stamp, sizeof(stamp), "%02d:%02d:%02d.%03ld",
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec, ts.tv_nsec / 1000000);
+    static const char prio_ch[] = {'V', 'D', 'I', 'W', 'E', 'F'};
+    int ci = (prio >= ANDROID_LOG_VERBOSE && prio <= ANDROID_LOG_FATAL)
+             ? (prio - ANDROID_LOG_VERBOSE) : 2;
+
+    int head = snprintf(line, sizeof(line), "%s %c/stepspoof: ", stamp, prio_ch[ci]);
+    int body = vsnprintf(line + head, sizeof(line) - (size_t)head - 2, fmt, ap);
+    if (body < 0) return;
+    int total = head + body;
+    if (total > (int)sizeof(line) - 2) total = (int)sizeof(line) - 2;
+    line[total++] = '\n';
+    ssize_t wr = write(g_log_fd, line, (size_t)total);
+    if (wr > 0) g_log_bytes += wr;
+    log_close_and_rotate_if_needed();
+}
+
+#if defined(__clang__)
+#define LOGFMT(fmt_idx) __attribute__((format(printf, fmt_idx, fmt_idx + 1)))
+#else
+#define LOGFMT(fmt_idx)
+#endif
+
+static void log_d(const char *fmt, ...) LOGFMT(1) {
+    va_list ap; va_start(ap, fmt); log_v(ANDROID_LOG_DEBUG, fmt, ap); va_end(ap);
+}
+static void log_i(const char *fmt, ...) LOGFMT(1) {
+    va_list ap; va_start(ap, fmt); log_v(ANDROID_LOG_INFO, fmt, ap); va_end(ap);
+}
+static void log_w(const char *fmt, ...) LOGFMT(1) {
+    va_list ap; va_start(ap, fmt); log_v(ANDROID_LOG_WARN, fmt, ap); va_end(ap);
+}
+static void log_e(const char *fmt, ...) LOGFMT(1) {
+    va_list ap; va_start(ap, fmt); log_v(ANDROID_LOG_ERROR, fmt, ap); va_end(ap);
+}
+
+#define LOGD(...) log_d(__VA_ARGS__)
+#define LOGI(...) log_i(__VA_ARGS__)
+#define LOGW(...) log_w(__VA_ARGS__)
+#define LOGE(...) log_e(__VA_ARGS__)
+
 static const char *TARGET_PKG = TARGET_PKG_STR;
 static constexpr size_t PAGE_SZ = 4096;
 
@@ -665,6 +790,32 @@ static void handle_client(int fd) {
         g_cfg.sim_active.store(true);
         LOGI("sim started: min=%d max=%d", g_cfg.sim_rate_min.load(), g_cfg.sim_rate_max.load());
         http_reply(fd, 200, "application/json", "{\"ok\":true,\"sim_active\":true}");
+    } else if (method == "GET" && path == "/api/log") {
+        // 返回日志文件路径与实际大小，WebUI 用它给用户提示去哪里取文件
+        char js[512];
+        struct stat st {};
+        long long sz = 0;
+        int exists = 0;
+        if (g_log_path[0] && stat(g_log_path, &st) == 0) {
+            sz = (long long)st.st_size;
+            exists = 1;
+        }
+        snprintf(js, sizeof(js),
+                 "{\"path\":\"%s\",\"exists\":%d,\"size\":%lld}",
+                 g_log_path[0] ? g_log_path : "", exists, sz);
+        http_reply(fd, 200, "application/json", js);
+    } else if (method == "POST" && path == "/api/log/clear") {
+        if (g_log_path[0]) {
+            close(g_log_fd);
+            g_log_fd = -1;
+            g_log_bytes = 0;
+            unlink(g_log_path);
+            LOGI("log cleared by request");
+        }
+        http_reply(fd, 200, "application/json", "{\"ok\":true}");
+    } else if (method == "POST" && path == "/api/log/mark") {
+        LOGI("=== user marked this point (WebUI) ===");
+        http_reply(fd, 200, "application/json", "{\"ok\":true}");
     } else if (method == "POST" && path == "/api/stop") {
         g_cfg.sim_active.store(false);
         LOGI("sim stopped");
@@ -775,7 +926,10 @@ public:
             return;
         }
 
-        LOGI("postAppSpecialize pid=%d main=%d", getpid(), is_main ? 1 : 0);
+        // 首个日志落盘，附带一次环境快照，便于他人排障
+        LOGI("===== stepspoof_joyrun v1.2.0 start pid=%d main=%d =====",
+             getpid(), is_main ? 1 : 0);
+        LOGI("log file: %s", g_log_path[0] ? g_log_path : "(not opened yet)");
 
         // PLT hook 没打上时，尝试 inline hook（Android 14+ 路径）
         if (g_hook_cnt.load() == 0) {
