@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>闪动校园 传感器控制</title>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{
+      font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;
+      background:linear-gradient(160deg,#1565c0 0%,#1976d2 40%,#0d47a1 100%);
+      min-height:100vh;color:#fff;
+    }
+    .header{padding:44px 24px 24px;text-align:center}
+    .header-icon{
+      width:76px;height:76px;
+      background:rgba(255,255,255,0.18);
+      border-radius:22px;
+      margin:0 auto 14px;
+      display:flex;align-items:center;justify-content:center;
+      font-size:38px;
+      box-shadow:0 4px 20px rgba(0,0,0,0.18);
+    }
+    .header h1{font-size:22px;font-weight:700;letter-spacing:.5px;margin-bottom:4px}
+    .header p{font-size:12px;opacity:.65;letter-spacing:.3px}
+    .card{
+      background:rgba(255,255,255,0.12);
+      backdrop-filter:blur(12px);
+      border-radius:18px;
+      margin:0 16px 14px;
+      padding:20px;
+      border:1px solid rgba(255,255,255,0.18);
+    }
+    .card-label{
+      font-size:11px;font-weight:700;
+      opacity:.65;letter-spacing:1px;
+      text-transform:uppercase;
+      margin-bottom:16px;
+    }
+    .toggle-row{display:flex;align-items:center;justify-content:space-between}
+    .toggle-info .name{font-size:16px;font-weight:600}
+    .toggle-info .sub{font-size:12px;opacity:.6;margin-top:3px}
+    .sw{position:relative;width:54px;height:30px;flex-shrink:0}
+    .sw input{opacity:0;width:0;height:0}
+    .sw-track{
+      position:absolute;inset:0;
+      background:rgba(255,255,255,0.2);
+      border-radius:30px;cursor:pointer;
+      transition:.3s;
+    }
+    .sw-track::before{
+      content:"";position:absolute;
+      width:24px;height:24px;left:3px;bottom:3px;
+      background:#fff;border-radius:50%;
+      transition:.3s;box-shadow:0 2px 6px rgba(0,0,0,.25);
+    }
+    .sw input:checked+.sw-track{background:#4caf50}
+    .sw input:checked+.sw-track::before{transform:translateX(24px)}
+    .slider-block+.slider-block{margin-top:22px}
+    .slider-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px}
+    .slider-head .lbl{font-size:15px;font-weight:500}
+    .slider-head .val{
+      font-size:17px;font-weight:700;
+      background:rgba(255,255,255,0.2);
+      padding:4px 14px;border-radius:20px;min-width:72px;text-align:center;
+    }
+    input[type=range]{
+      -webkit-appearance:none;width:100%;height:6px;
+      border-radius:3px;background:rgba(255,255,255,.28);outline:none;
+    }
+    input[type=range]::-webkit-slider-thumb{
+      -webkit-appearance:none;width:24px;height:24px;border-radius:50%;
+      background:#fff;cursor:pointer;
+      box-shadow:0 2px 8px rgba(0,0,0,.28);
+    }
+    .divider{height:1px;background:rgba(255,255,255,.12);margin:18px 0}
+    .hint{margin-top:12px;font-size:12px;line-height:1.6;color:rgba(200,220,255,.55);font-family:ui-monospace,Menlo,monospace}
+    .btn-sim{
+      width:100%;padding:17px;border:none;border-radius:14px;
+      font-size:18px;font-weight:700;cursor:pointer;
+      letter-spacing:1px;transition:all .25s;
+    }
+    .btn-sim.off{background:linear-gradient(135deg,#43e97b 0%,#38f9d7 100%);color:#0d1b2a}
+    .btn-sim.on {background:linear-gradient(135deg,#f5576c 0%,#f093fb 100%);color:#fff}
+    .btn-sim:active{transform:scale(.97)}
+    .status-row{display:flex;align-items:center;gap:8px;margin-top:14px}
+    .dot{width:9px;height:9px;border-radius:50%;background:rgba(255,255,255,.3);flex-shrink:0}
+    .dot.live{background:#34d399;box-shadow:0 0 8px #34d399}
+    .dot.run{background:#4caf50;box-shadow:0 0 7px #4caf50;animation:blink 1.4s infinite}
+    @keyframes blink{0%,100%{opacity:1}50%{opacity:.35}}
+    .status-txt{font-size:13px;opacity:.8}
+    .kv{display:flex;justify-content:space-between;font-size:13px;padding:6px 0;opacity:.85}
+    .kv b{font-weight:600}
+    .toast{
+      position:fixed;bottom:36px;left:50%;
+      transform:translateX(-50%) translateY(70px);
+      background:rgba(10,10,30,.82);color:#fff;
+      padding:10px 22px;border-radius:22px;font-size:14px;
+      transition:transform .3s;pointer-events:none;white-space:nowrap;
+    }
+    .toast.show{transform:translateX(-50%) translateY(0)}
+    .footer{text-align:center;padding:8px 0 28px;font-size:11px;opacity:.35}
+  </style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-icon">🏃</div>
+  <h1>闪动校园 传感器控制</h1>
+  <p>步频仿真 · 方案B · Zygisk Native</p>
+</div>
+
+<div class="card">
+  <div class="toggle-row">
+    <div class="toggle-info">
+      <div class="name">启用模块</div>
+      <div class="sub">改写传感器步数事件</div>
+    </div>
+    <label class="sw">
+      <input type="checkbox" id="chkEnabled">
+      <span class="sw-track"></span>
+    </label>
+  </div>
+  <div class="divider"></div>
+  <div class="toggle-row">
+    <div class="toggle-info">
+      <div class="name">加速度波形仿真</div>
+      <div class="sub">App 自研计步器时需要打开</div>
+    </div>
+    <label class="sw">
+      <input type="checkbox" id="chkAccel">
+      <span class="sw-track"></span>
+    </label>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-label">步频范围（步/分钟）</div>
+  <div class="slider-block">
+    <div class="slider-head">
+      <span class="lbl">最低步频</span>
+      <span class="val" id="vMin">80</span>
+    </div>
+    <input type="range" id="sMin" min="40" max="240" value="80">
+  </div>
+  <div class="slider-block">
+    <div class="slider-head">
+      <span class="lbl">最高步频</span>
+      <span class="val" id="vMax">120</span>
+    </div>
+    <input type="range" id="sMax" min="40" max="240" value="120">
+  </div>
+  <div class="divider"></div>
+  <div class="slider-block">
+    <div class="slider-head">
+      <span class="lbl">步长（厘米）</span>
+      <span class="val" id="vStride">110</span>
+    </div>
+    <input type="range" id="sStride" min="60" max="150" value="110">
+  </div>
+  <div class="hint" id="hintPace">—</div>
+</div>
+
+<div class="card">
+  <button class="btn-sim off" id="btnSim">开始仿真</button>
+  <div class="status-row">
+    <div class="dot" id="dot"></div>
+    <span class="status-txt" id="sTxt">未连接（请先启动闪动校园）</span>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-label">运行状态</div>
+  <div class="kv"><span>已挂 Hook</span><b id="kHooks">-</b></div>
+  <div class="kv"><span>Hook 命中</span><b id="kHits">-</b></div>
+  <div class="kv"><span>已改写事件</span><b id="kPatched">-</b></div>
+  <div class="kv"><span>仿真累计步数</span><b id="kSim">-</b></div>
+  <div class="kv"><span>加速度事件</span><b id="kAcc">-</b></div>
+  <div class="kv"><span>计步检测事件 STD 0x12</span><b id="kDet">-</b></div>
+  <div class="kv"><span>步数累计传感器 STC 0x13</span><b id="kCnt">-</b></div>
+  <div class="hint">STD/STC 仅在 App 注册硬件计步器时才会计数。闪动校园用 400Hz 加速度自算步数，这两项恒为 0 属正常现象，看「加速度事件」即可。</div>
+</div>
+
+<div class="footer">stepspoof_joyrun v1.1.8</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const PKG  = 'com.huachenjie.shandong_school';
+const CONF = '/data/data/' + PKG + '/files/stepspoof.conf';
+
+let S = {enabled:true, sim_active:false, sim_rate_min:80, sim_rate_max:120, sim_accel:true, stride:110};
+let online = false;
+
+function toast(msg){
+  const t=document.getElementById('toast');
+  t.textContent=msg;t.classList.add('show');
+  clearTimeout(t._tm);
+  t._tm=setTimeout(()=>t.classList.remove('show'),2200);
+}
+
+/* ── root shell（KernelSU ksu.exec）── */
+async function sh(cmd){
+  try{
+    const r = await ksu.exec(cmd);
+    if (typeof r === 'string') return r;
+    return (r && (r.stdout !== undefined ? r.stdout : r.out)) || '';
+  }catch(e){ return ''; }
+}
+function b64(s){ return btoa(unescape(encodeURIComponent(s))); }
+
+/* ── 与 native 通信：走 root shell + toybox nc 访问 127.0.0.1:8888
+      （KSU WebUI 页面是 https 源，直接 fetch http:// 会被 WebView 当混合内容拦截）── */
+async function api(path, body){
+  const json = body ? JSON.stringify(body) : '';
+
+  // 1) 直连（WebView 允许同源/本地请求时最快）
+  try{
+    const ctl = new AbortController();
+    const tm = setTimeout(()=>ctl.abort(), 1200);
+    const r = await fetch('http://127.0.0.1:8888'+path, {
+      method: body ? 'POST' : 'GET',
+      headers: body ? {'Content-Type':'application/json'} : {},
+      body: body ? json : undefined,
+      signal: ctl.signal
+    });
+    clearTimeout(tm);
+    if(r.ok) return await r.json();
+  }catch(e){}
+
+  // 2) root shell + toybox nc 回退（绕过 https 页面的混合内容拦截）
+  const req = body
+    ? 'POST '+path+' HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n'
+      +'Content-Length: '+json.length+'\r\nConnection: close\r\n\r\n'+json
+    : 'GET '+path+' HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n';
+  const out = await sh("echo '"+b64(req)+"' | base64 -d | toybox nc 127.0.0.1 8888 2>/dev/null");
+  const i = out.indexOf('\r\n\r\n');
+  if(i < 0) throw new Error('no response');
+  return JSON.parse(out.slice(i+4));
+}
+
+/* ── 持久化：写控制文件，App 下次启动/运行时轮询生效 ── */
+async function persist(){
+  const txt = 'enabled='+(S.enabled?1:0)+'\n'
+            + 'offset=0\nabsolute=0\nabsolute_value=0\n'
+            + 'sim_active='+(S.sim_active?1:0)+'\n'
+            + 'sim_min='+S.sim_rate_min+'\nsim_max='+S.sim_rate_max+'\n'
+            + 'sim_accel='+(S.sim_accel?1:0)+'\n'
+            + 'stride='+S.stride+'\n';
+  await sh("echo '"+b64(txt)+"' | base64 -d > "+CONF+" 2>/dev/null; chmod 666 "+CONF+" 2>/dev/null");
+}
+
+function updatePace(cur){
+  const hint = document.getElementById('hintPace');
+  if(!hint) return;
+  const rate = cur > 0 ? cur : Math.round((S.sim_rate_min + S.sim_rate_max) / 2);
+  const speed = rate * S.stride / 100 / 60;      // m/s
+  if(speed <= 0){ hint.textContent = '—'; return; }
+  const secPerKm = 1000 / speed;
+  const mm = Math.floor(secPerKm / 60);
+  const ss = Math.round(secPerKm % 60);
+  hint.textContent = '锁定步频 ' + rate + ' 步/分 → 速度 ' + speed.toFixed(2)
+    + ' m/s · 配速 ' + mm + "'" + String(ss).padStart(2,'0') + '"/km';
+}
+
+function render(st){
+  const btn=document.getElementById('btnSim');
+  const dot=document.getElementById('dot');
+  const st_=document.getElementById('sTxt');
+  document.getElementById('chkEnabled').checked = S.enabled;
+  document.getElementById('chkAccel').checked = S.sim_accel;
+  document.getElementById('sMin').value = S.sim_rate_min;
+  document.getElementById('sMax').value = S.sim_rate_max;
+  document.getElementById('vMin').textContent = S.sim_rate_min;
+  document.getElementById('vMax').textContent = S.sim_rate_max;
+  document.getElementById('sStride').value = S.stride;
+  document.getElementById('vStride').textContent = S.stride;
+  updatePace(st ? st.cur_rate : 0);
+
+  if(S.sim_active){
+    btn.textContent='停止仿真'; btn.className='btn-sim on';
+    dot.className='dot run';
+    st_.textContent='仿真运行中 · '+S.sim_rate_min+'–'+S.sim_rate_max+' 步/分钟';
+  }else{
+    btn.textContent='开始仿真'; btn.className='btn-sim off';
+    dot.className='dot'+(online?' live':'');
+    st_.textContent = online ? (S.enabled?'仿真待启动':'模块已禁用')
+                             : '未连接（请先启动闪动校园）';
+  }
+  if(st){
+    document.getElementById('kHooks').textContent   = st.hooks ?? '-';
+    document.getElementById('kHits').textContent    = st.hook_hits ?? '-';
+    document.getElementById('kPatched').textContent = st.patched_events ?? '-';
+    document.getElementById('kSim').textContent     = st.sim_steps ?? '-';
+    document.getElementById('kAcc').textContent     = st.acc ?? '-';
+    document.getElementById('kDet').textContent     = st.stepdet ?? '-';
+    document.getElementById('kCnt').textContent     = st.stepcnt ?? '-';
+  }
+}
+
+async function load(){
+  try{
+    const st = await api('/api/status');
+    online = true;
+    S.enabled      = !!st.enabled;
+    S.sim_active   = !!st.sim_active;
+    S.sim_rate_min = st.sim_rate_min;
+    S.sim_rate_max = st.sim_rate_max;
+    S.sim_accel    = !!st.sim_accel;
+    S.stride       = st.stride ?? 110;
+    render(st);
+  }catch(e){
+    online = false;
+    // 模块没跑（App 未启动）：退化为读持久化文件
+    const txt = await sh('cat '+CONF+' 2>/dev/null');
+    for(const line of txt.split('\n')){
+      const i=line.indexOf('='); if(i<0) continue;
+      const k=line.slice(0,i).trim(), v=line.slice(i+1).trim();
+      if(k==='enabled') S.enabled = v==='1';
+      else if(k==='sim_active') S.sim_active = v==='1';
+      else if(k==='sim_min') S.sim_rate_min = Math.max(40,Math.min(240,parseInt(v)||80));
+      else if(k==='sim_max') S.sim_rate_max = Math.max(40,Math.min(240,parseInt(v)||120));
+      else if(k==='sim_accel') S.sim_accel = v==='1';
+      else if(k==='stride') S.stride = Math.max(60,Math.min(150,parseInt(v)||110));
+    }
+    render(null);
+  }
+}
+
+async function push(){
+  await api('/api/config',{
+    enabled:S.enabled?1:0,
+    step_offset:0,
+    absolute_mode:0,
+    absolute_value:0,
+    sim_active:S.sim_active?1:0,
+    sim_rate_min:S.sim_rate_min,
+    sim_rate_max:S.sim_rate_max,
+    sim_accel:S.sim_accel?1:0,
+    stride:S.stride
+  });
+  online = true;
+}
+
+async function save(){
+  try{ await push(); }
+  catch(e){
+    online=false; render(null);
+    toast('未连接模块（请先启动闪动校园）');
+    await persist();   // 仍然落盘，等 App 启动后生效
+    return false;
+  }
+  await persist();
+  return true;
+}
+
+/* ── events ── */
+document.getElementById('chkEnabled').addEventListener('change',async function(){
+  S.enabled=this.checked;
+  if(!S.enabled) S.sim_active=false;
+  await save(); render(null);
+  toast(S.enabled?'模块已启用':'模块已禁用');
+});
+
+document.getElementById('chkAccel').addEventListener('change',async function(){
+  S.sim_accel=this.checked;
+  await save(); render(null);
+  toast(S.sim_accel?'加速度仿真已开启':'加速度仿真已关闭');
+});
+
+document.getElementById('sMin').addEventListener('input',function(){
+  let v=parseInt(this.value);
+  if(v>S.sim_rate_max){v=S.sim_rate_max;this.value=v;}
+  S.sim_rate_min=v;document.getElementById('vMin').textContent=v;
+});
+document.getElementById('sMin').addEventListener('change',()=>save());
+
+document.getElementById('sMax').addEventListener('input',function(){
+  let v=parseInt(this.value);
+  if(v<S.sim_rate_min){v=S.sim_rate_min;this.value=v;}
+  S.sim_rate_max=v;document.getElementById('vMax').textContent=v;
+});
+document.getElementById('sMax').addEventListener('change',()=>save());
+
+document.getElementById('sStride').addEventListener('input',function(){
+  S.stride=parseInt(this.value);
+  document.getElementById('vStride').textContent=S.stride;
+  updatePace(0);
+});
+document.getElementById('sStride').addEventListener('change',()=>save());
+
+document.getElementById('btnSim').addEventListener('click',async function(){
+  if(!S.enabled){ toast('请先启用模块'); return; }
+  if(!online){
+    toast('未连接模块，请先启动闪动校园');
+    return;
+  }
+  S.sim_active=!S.sim_active;
+  const ok=await save();
+  render(null);
+  if(ok) toast(S.sim_active?'仿真已开始':'仿真已停止');
+});
+
+/* 每 3 秒同步 */
+setInterval(load,3000);
+window.addEventListener('DOMContentLoaded',load);
+</script>
+</body>
+</html>

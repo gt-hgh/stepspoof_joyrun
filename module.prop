@@ -1,0 +1,6 @@
+id=stepspoof_joyrun
+name=闪动校园 传感器控制
+version=v1.1.8
+versionCode=9
+author=local
+description=纯 native Zygisk 模块：步数/传感器事件改写 + 步频仿真线程 + KSU WebUI 控制。目标包名 com.huachenjie.shandong_school。

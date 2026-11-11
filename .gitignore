@@ -1,0 +1,28 @@
+# 编译中间产物
+build/
+obj/
+libs/
+
+# IDE / 编辑器
+.idea/
+*.iml
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 临时诊断脚本（不入仓）
+scripts/diag.sh
+scripts/probe.sh
+scripts/probe2.sh
+scripts/probe3.sh
+scripts/cleanup_dup.sh
+scripts/syms.sh
+scripts/disasm.sh
+scripts/disasm2.sh
+
+# 保留 dist/*.zip 供直接下载安装
+!dist/
+!dist/*.zip
