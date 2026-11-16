@@ -1,14 +1,23 @@
-// stepspoof_joyrun v1.2.0 — 纯 native Zygisk 模块
+// stepspoof_joyrun v1.3.0 — 纯 native Zygisk 模块
 // 目标：com.huachenjie.shandong_school（闪动校园）
 // 功能：
 //   1) 加速度波形仿真（FuckRun 设计：X=0, Y=1.5·cos, Z=9.81+3.5·sin）
 //      驱动 App 自研带通滤波计步算法（h9.d）产生步数
-//   2) STEP_COUNTER / STEP_DETECTOR 事件改写（App 注册硬件计步器时生效）
-//   3) 步频仿真线程：在 [min, max] 区间随机锁定步频，整段稳定不抖动
-//   4) 运行日志：同时写 logcat 与 /sdcard/Download/stepspoof_joyrun.log
+//   2) 陀螺仪 / 旋转矢量同频同相注入（v1.3.0）
+//      只有加速度在动、角速度和姿态恒为 0，是明显的传感器伪造特征；
+//      现在三路信号用同一个 2πft 相位合成，多传感器融合校验看到的是一段
+//      完整的人体跑步动作。
+//   3) STEP_COUNTER / STEP_DETECTOR 事件改写（App 注册硬件计步器时生效）
+//      v1.3.0 起计步器走「基线锚定 + 单调钳制」：仿真开启瞬间锁住当前硬件
+//      读数，之后只输出平滑递增的曲线，不会跳变或倒退触发防作弊清零。
+//   4) 步频仿真线程：在 [min, max] 区间随机锁定步频（默认 135–160，跑步区间），
+//      整段稳定不抖动；仿真步数按 pid 分片写入共享目录并在各进程间求和，
+//      保证多进程读到的步数完全一致。
+//   5) 运行日志：同时写 logcat 与 /sdcard/Download/stepspoof_joyrun.log
 //      （2MB 自动轮转到 .old；/sdcard 不可写时降级到 App 私有目录）
-//   5) 本地 HTTP API（127.0.0.1:8888）供 KSU WebUI 通过 root shell nc 访问
-//   6) conf_watch_loop：轮询 App 私有目录 stepspoof.conf，断连后持久化生效
+//      每行带 pid；每 10 秒一行 heartbeat 快照；每种传感器类型首次出现报一次。
+//   6) 本地 HTTP API（127.0.0.1:8888）供 KSU WebUI 通过 root shell nc 访问
+//   7) conf_watch_loop：轮询 App 私有目录 stepspoof.conf，断连后持久化生效
 // 不依赖 LSPosed / 不建 ClassLoader / 不加载内存 dex。
 //
 // Hook 路径：
@@ -37,6 +46,7 @@
 #include <vector>
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <malloc.h>
@@ -140,7 +150,8 @@ static void log_v(int prio, const char *fmt, va_list ap) {
     int ci = (prio >= ANDROID_LOG_VERBOSE && prio <= ANDROID_LOG_FATAL)
              ? (prio - ANDROID_LOG_VERBOSE) : 2;
 
-    int head = snprintf(line, sizeof(line), "%s %c/stepspoof: ", stamp, prio_ch[ci]);
+    int head = snprintf(line, sizeof(line), "%s pid=%d %c/stepspoof: ",
+                        stamp, getpid(), prio_ch[ci]);
     int body = vsnprintf(line + head, sizeof(line) - (size_t)head - 2, fmt, ap);
     if (body < 0) return;
     int total = head + body;
@@ -188,8 +199,10 @@ struct Config {
     std::atomic<long long> absolute_value{0};
     // 步频仿真
     std::atomic<bool> sim_active{false};
-    std::atomic<int> sim_rate_min{60};    // 步/分钟
-    std::atomic<int> sim_rate_max{120};   // 步/分钟
+    // 默认步频对齐跑步区间：135–160 步/分。
+    // 旧默认 60–120 换算配速约 9'30"/km，是走路速度，过不了闪动校园的跑步判定。
+    std::atomic<int> sim_rate_min{135};   // 步/分钟
+    std::atomic<int> sim_rate_max{160};   // 步/分钟
     std::atomic<bool> sim_accel{true};    // 是否合成加速度波形（自研计步器的 App 需要）
     // GPS 联动：闪动校园结算时拿步数/距离/GPS 轨迹做一致性校验。
     // 步长决定「同一速度下应有的步频」，也决定「同一距离下应有的步数」。
@@ -209,14 +222,101 @@ static get_events_fn g_orig_get_events = nullptr;
 static std::atomic<long long> g_hook_hits{0};
 static std::atomic<long long> g_patched_events{0};
 // 仿真产生的步数（与用户设置的 step_offset 分离，避免被配置回写覆盖）
+// 拆成三份：本进程 local + 其它进程分片 other = 对外暴露的 total
 static std::atomic<long long> g_sim_steps{0};
+static std::atomic<long long> g_local_steps{0};
+static std::atomic<long long> g_sim_other{0};
+static std::atomic<int> g_sim_peers{0};
 // 当前瞬时目标步频（步/分钟），由 sim_loop 刷新，供加速度波形合成使用
 static std::atomic<int> g_cur_rate{0};
 // 事件类型直方图（诊断：看清 App 到底收哪些传感器）
-static std::atomic<long long> g_type_cnt[32];
-static void bump_type(int t) {
-    if (t >= 0 && t < 32) g_type_cnt[t].fetch_add(1, std::memory_order_relaxed);
+// 传感器类型号最大到 35（ACCELEROMETER_UNCALIBRATED），留到 64 兜住厂商扩展值
+static constexpr int kTypeSlots = 64;
+static std::atomic<long long> g_type_cnt[kTypeSlots];
+// 每个类型在本进程内是否已报过首次出现
+static std::atomic<bool> g_type_seen[kTypeSlots];
+
+static const char *sensor_type_name(int t) {
+    switch (t) {
+        case 1:  return "ACCELEROMETER";
+        case 2:  return "MAGNETIC_FIELD";
+        case 3:  return "ORIENTATION";
+        case 4:  return "GYROSCOPE";
+        case 5:  return "LIGHT";
+        case 6:  return "PRESSURE";
+        case 7:  return "TEMPERATURE";
+        case 8:  return "PROXIMITY";
+        case 9:  return "GRAVITY";
+        case 10: return "LINEAR_ACCELERATION";
+        case 11: return "ROTATION_VECTOR";
+        case 12: return "RELATIVE_HUMIDITY";
+        case 13: return "AMBIENT_TEMPERATURE";
+        case 14: return "MAGNETIC_FIELD_UNCALIBRATED";
+        case 15: return "GAME_ROTATION_VECTOR";
+        case 16: return "GYROSCOPE_UNCALIBRATED";
+        case 17: return "SIGNIFICANT_MOTION";
+        case 18: return "STEP_DETECTOR";
+        case 19: return "STEP_COUNTER";
+        case 20: return "GEOMAGNETIC_ROTATION_VECTOR";
+        case 21: return "HEART_RATE";
+        case 28: return "POSE_6DOF";
+        case 29: return "STATIONARY_DETECT";
+        case 30: return "MOTION_DETECT";
+        case 31: return "HEART_BEAT";
+        case 32: return "DYNAMIC_SENSOR_META";
+        case 33: return "ADDITIONAL_INFO";
+        case 34: return "LOW_LATENCY_OFFBODY_DETECT";
+        case 35: return "ACCELEROMETER_UNCALIBRATED";
+        default: return "?";
+    }
 }
+
+// 是不是「能拿来算步」的加速度类事件：
+//   1  ACCELEROMETER（含重力）
+//   10 LINEAR_ACCELERATION（已去重力）
+//   35 ACCELEROMETER_UNCALIBRATED（含重力，data[3..5] 是 bias）
+static inline bool is_accel_type(int t) {
+    return t == ASENSOR_TYPE_ACCELEROMETER ||
+           t == ASENSOR_TYPE_LINEAR_ACCELERATION ||
+           t == ASENSOR_TYPE_ACCELEROMETER_UNCALIBRATED;
+}
+
+// 每个类型第一次出现时报一行，带人类可读名，避免再看 type0=33 猜是哪个
+static void bump_type(int t) {
+    if (t < 0 || t >= kTypeSlots) return;
+    g_type_cnt[t].fetch_add(1, std::memory_order_relaxed);
+    if (!g_type_seen[t].exchange(true, std::memory_order_relaxed)) {
+        LOGI("sensor type %d (%s) first seen", t, sensor_type_name(t));
+    }
+}
+
+// 加速度改写计数（独立于 STEP_COUNTER，两者互不影响诊断）
+static std::atomic<long long> g_accel_patched{0};
+// 收到加速度事件但仿真没开——这是「App 在读、但模块没注」的直接证据
+static std::atomic<bool> g_accel_seen_simoff{false};
+// 陀螺仪 / 旋转矢量改写计数。
+// 这两路传感器单独看没有「步数」意义，但它们和加速度是同一段跑步动作的不同投影：
+// 加速度在周期震荡而陀螺仪/旋转矢量恒为 0，等于告诉 App「人没在动」，会被多传感器
+// 融合一致性校验判掉。所以仿真开启时同步注入同频率的微幅角速度/姿态扰动。
+static std::atomic<long long> g_gyro_patched{0};
+static std::atomic<long long> g_rv_patched{0};
+static std::atomic<bool> g_gyro_seen_simoff{false};
+static std::atomic<bool> g_rv_seen_simoff{false};
+
+// ---------------------------------------------------------------------------
+// STEP_COUNTER 基线锚定
+// 闪动校园启动时会先读一次硬件计步器作为基准，之后只关心「相对基准的增量」。
+// 旧逻辑直接把 offset（含 sim_steps）加到硬件读数上：仿真一启动 sim_steps 从 0
+// 开始累加，但硬件读数在两次读取之间可能已经自己往前走了一截，于是输出值出现
+// 跳变甚至倒退，触发 App 的防作弊清零。
+// 新逻辑：仿真开启的瞬间抓住当前硬件读数，把「以后应该输出的值」锁成一条平滑
+// 递增曲线（cur + sim_steps），永不倒退、永不自发跳变。
+// ---------------------------------------------------------------------------
+static std::atomic<bool>   g_base_valid{false};   // 是否已经锚定
+static std::atomic<long long> g_last_out{0};      // 上一次输出的计步器值（单调不减）
+static std::atomic<long long> g_hw_at_anchor{0};  // 锚定时刻的硬件原始读数（诊断用）
+static std::atomic<long long> g_cnt_patched{0};   // STEP_COUNTER 改写次数
+static std::atomic<bool>   g_cnt_seen_simoff{false};
 // 重入深度：防止 read→filterEvents 这种嵌套调用把同一批事件打两遍
 static thread_local int g_depth = 0;
 
@@ -225,33 +325,73 @@ static thread_local int g_depth = 0;
 // ---------------------------------------------------------------------------
 static inline void patch_event(ASensorEvent *ev) {
     if (ev->type == ASENSOR_TYPE_STEP_COUNTER) {
-        long long offset = g_cfg.step_offset.load(std::memory_order_relaxed)
-                         + g_sim_steps.load(std::memory_order_relaxed);
+        bool sim_on = g_cfg.sim_active.load(std::memory_order_relaxed);
+        long long sim = g_sim_steps.load(std::memory_order_relaxed);
+        long long offset = g_cfg.step_offset.load(std::memory_order_relaxed);
+
+        uint64_t hw = ev->u64.step_counter;
+        long long out;
+
         if (g_cfg.absolute_mode.load(std::memory_order_relaxed)) {
-            uint64_t v = (uint64_t)g_cfg.absolute_value.load(std::memory_order_relaxed);
-            memcpy(&ev->u64.step_counter, &v, sizeof(v));
-        } else if (offset != 0) {
-            uint64_t cur = ev->u64.step_counter;
-            int64_t nv = (int64_t)cur + offset;
-            if (nv < 0) nv = 0;
-            uint64_t out = (uint64_t)nv;
-            memcpy(&ev->u64.step_counter, &out, sizeof(out));
+            out = g_cfg.absolute_value.load(std::memory_order_relaxed) + sim;
+        } else if (sim_on) {
+            // 仿真开启：以「锚定时刻硬件读数 + 已仿真步数」为输出曲线。
+            // 首次进入（或上次锚定已被停止仿真清掉）时锚定。
+            if (!g_base_valid.exchange(true, std::memory_order_relaxed)) {
+                g_hw_at_anchor.store((long long)hw, std::memory_order_relaxed);
+                g_last_out.store((long long)hw, std::memory_order_relaxed);
+                LOGI("step_counter baseline anchored: hw=%llu (out starts here)",
+                     (unsigned long long)hw);
+            }
+            out = (long long)hw + (sim - g_hw_at_anchor.load(std::memory_order_relaxed));
+            if (out < 0) out = 0;
+            // 单调钳制：输出只增不减，杜绝倒退触发的防作弊清零
+            long long prev = g_last_out.load(std::memory_order_relaxed);
+            if (out < prev) out = prev;
+            g_last_out.store(out, std::memory_order_relaxed);
+        } else {
+            // 仿真没开：只做用户手动偏移，并且同样单调，避免回绕跳变
+            if (offset != 0) {
+                long long nv = (long long)hw + offset;
+                if (nv < 0) nv = 0;
+                out = nv;
+            } else {
+                out = (long long)hw;
+            }
+            long long prev = g_last_out.load(std::memory_order_relaxed);
+            if (g_base_valid.load(std::memory_order_relaxed) && out < prev) out = prev;
+            g_last_out.store(out, std::memory_order_relaxed);
+            if (!g_cnt_seen_simoff.exchange(true, std::memory_order_relaxed)) {
+                LOGI("step_counter seen but sim off (hw=%llu offset=%lld)",
+                     (unsigned long long)hw, offset);
+            }
         }
+
+        uint64_t outv = (uint64_t)out;
+        memcpy(&ev->u64.step_counter, &outv, sizeof(outv));
         g_patched_events.fetch_add(1, std::memory_order_relaxed);
-        static std::atomic<int> once{0};
-        if (once.fetch_add(1) == 0) {
-            LOGI("first patch: type=%d counter=%llu offset=%lld sim=%lld",
-                 ev->type, (unsigned long long)ev->u64.step_counter,
-                 (long long)g_cfg.step_offset.load(), (long long)g_sim_steps.load());
+        long long c = g_cnt_patched.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (c == 1 || c % 200 == 0) {
+            long long sim_delta = g_base_valid.load(std::memory_order_relaxed)
+                ? (long long)hw - g_hw_at_anchor.load(std::memory_order_relaxed) : 0;
+            LOGI("step_counter patch #%lld: hw=%llu out=%llu sim_steps=%lld "
+                 "hw_delta=%lld sim=%d offset=%lld",
+                 c, (unsigned long long)hw, (unsigned long long)outv, sim,
+                 sim_delta, sim_on ? 1 : 0, offset);
         }
     } else if (ev->type == ASENSOR_TYPE_STEP_DETECTOR) {
         if (g_cfg.sim_active.load(std::memory_order_relaxed)) {
             ev->data[0] = 1.0f;   // 原设计：每个检测事件强制为 1 步
             g_patched_events.fetch_add(1, std::memory_order_relaxed);
+            static std::atomic<long long> n_det{0};
+            long long c = n_det.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (c == 1 || c % 200 == 0) {
+                LOGI("step_detector patch #%lld: forced 1.0", c);
+            }
         } else if (g_cfg.absolute_mode.load(std::memory_order_relaxed)) {
             ev->data[0] = 0.0f;
         }
-    } else if (ev->type == ASENSOR_TYPE_ACCELEROMETER) {
+    } else if (is_accel_type(ev->type)) {
         // 波形严格对齐 FuckRun / RunHook 原设计（对闪动校园实测兼容）：
         //     X = 0
         //     Y = 1.5·cos(2πft) + jitter(±0.15)
@@ -259,23 +399,128 @@ static inline void patch_event(ASensorEvent *ev) {
         // 必须是完整正负正弦。此前用的单向尖峰 s³ 只有正向冲量，400Hz 采样下
         // 绝大多数样本贴着 9.81 重力基线，自研计步器做带通滤波后能量不足，
         // 判定为静止 → 结算步数为 0。
-        if (g_cfg.sim_active.load(std::memory_order_relaxed) &&
-            g_cfg.sim_accel.load(std::memory_order_relaxed)) {
+        //
+        // 覆盖三种「能算步」的加速度事件：
+        //   1  ACCELEROMETER               含重力，Z 基线 9.81
+        //   10 LINEAR_ACCELERATION         已去重力，Z 基线 0
+        //   35 ACCELEROMETER_UNCALIBRATED  含重力，data[0..2]=实测值 data[3..5]=bias
+        bool sim_on = g_cfg.sim_active.load(std::memory_order_relaxed) &&
+                      g_cfg.sim_accel.load(std::memory_order_relaxed);
+        if (sim_on) {
             int rate = g_cur_rate.load(std::memory_order_relaxed);
             if (rate <= 0) rate = g_cfg.sim_rate_min.load(std::memory_order_relaxed);
             if (rate > 0) {
                 double f = (double)rate / 60.0;                 // 步频 Hz
                 double t = (double)ev->timestamp * 1e-9;        // 秒
                 double ph = 2.0 * M_PI * f * t;
-                double z = 9.81 + 3.5 * sin(ph);
+                double base = (ev->type == ASENSOR_TYPE_LINEAR_ACCELERATION) ? 0.0 : 9.81;
+                double z = base + 3.5 * sin(ph);
                 double y = 1.5 * cos(ph);
                 double jy = ((double)rand() / (double)RAND_MAX - 0.5) * 0.3;
                 double jz = ((double)rand() / (double)RAND_MAX - 0.5) * 0.3;
                 ev->data[0] = 0.0f;
                 ev->data[1] = (float)(y + jy);
                 ev->data[2] = (float)(z + jz);
+                if (ev->type == ASENSOR_TYPE_ACCELEROMETER_UNCALIBRATED) {
+                    // bias 保持不动，让实测值 - bias 后仍是同一条波形
+                    ev->data[3] = ev->data[0];
+                    ev->data[4] = ev->data[1];
+                    ev->data[5] = ev->data[2];
+                }
                 g_patched_events.fetch_add(1, std::memory_order_relaxed);
+                g_accel_patched.fetch_add(1, std::memory_order_relaxed);
+                static std::atomic<long long> n_acc{0};
+                long long c = n_acc.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (c == 1) {
+                    LOGI("first accel patch: type=%d (%s) rate=%d pid=%d",
+                         ev->type, sensor_type_name(ev->type), rate, getpid());
+                }
             }
+        } else if (!g_accel_seen_simoff.exchange(true, std::memory_order_relaxed)) {
+            // 关键诊断：App 确实在读加速度，但仿真没开（或 sim_accel 关着）
+            LOGI("accel event %d (%s) seen but sim off "
+                 "(sim_active=%d sim_accel=%d)",
+                 ev->type, sensor_type_name(ev->type),
+                 g_cfg.sim_active.load() ? 1 : 0,
+                 g_cfg.sim_accel.load() ? 1 : 0);
+        }
+    } else if (ev->type == ASENSOR_TYPE_GYROSCOPE ||
+               ev->type == ASENSOR_TYPE_GYROSCOPE_UNCALIBRATED) {
+        // 陀螺仪：与加速度同频率、同相位的微幅角速度。
+        // 跑步时躯干绕 Y 轴（俯仰方向）每秒轻微摆动 1~2 次，峰值幅度约 ±30°/s。
+        // 与加速度用同一个 2πft 相位，保证多传感器融合时「动作是同一段」。
+        // data[0..2] = 角速度 rad/s（X/Y/Z），GYROSCOPE_UNCALIBRATED 时 data[3..5] 是 bias。
+        bool sim_on = g_cfg.sim_active.load(std::memory_order_relaxed) &&
+                      g_cfg.sim_accel.load(std::memory_order_relaxed);
+        if (sim_on) {
+            int rate = g_cur_rate.load(std::memory_order_relaxed);
+            if (rate <= 0) rate = g_cfg.sim_rate_min.load(std::memory_order_relaxed);
+            if (rate > 0) {
+                double f = (double)rate / 60.0;
+                double t = (double)ev->timestamp * 1e-9;
+                double ph = 2.0 * M_PI * f * t;
+                const double A = 0.52;                    // ≈30°/s 峰值
+                double gx = 0.15 * A * cos(ph);           // 侧向微摆
+                double gy = A * cos(ph);                  // 主摆动轴
+                double gz = 0.12 * A * sin(ph);           // 偏航微抖
+                double jy = ((double)rand() / (double)RAND_MAX - 0.5) * 0.06;
+                ev->data[0] = (float)gx;
+                ev->data[1] = (float)(gy + jy);
+                ev->data[2] = (float)gz;
+                if (ev->type == ASENSOR_TYPE_GYROSCOPE_UNCALIBRATED) {
+                    ev->data[3] = 0.0f;   // bias 归零，让实测值 - bias 仍是同一条曲线
+                    ev->data[4] = 0.0f;
+                    ev->data[5] = 0.0f;
+                }
+                g_patched_events.fetch_add(1, std::memory_order_relaxed);
+                g_gyro_patched.fetch_add(1, std::memory_order_relaxed);
+                static std::atomic<long long> n_gy{0};
+                long long c = n_gy.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (c == 1) {
+                    LOGI("first gyro patch: rate=%d A=%.2f rad/s pid=%d", rate, A, getpid());
+                }
+            }
+        } else if (!g_gyro_seen_simoff.exchange(true, std::memory_order_relaxed)) {
+            LOGI("gyroscope event seen but sim off (sim_active=%d)",
+                 g_cfg.sim_active.load() ? 1 : 0);
+        }
+    } else if (ev->type == ASENSOR_TYPE_ROTATION_VECTOR ||
+               ev->type == ASENSOR_TYPE_GAME_ROTATION_VECTOR) {
+        // 旋转矢量：四元数 x,y,z,w（w 在 data[3]）。
+        // App 若用旋转矢量做姿态解算再反推步态，恒定的四元数同样会被判静止。
+        // 这里给一个绕 X 轴的小角度往复摆动（±2.5°），与步频同相。
+        bool sim_on = g_cfg.sim_active.load(std::memory_order_relaxed) &&
+                      g_cfg.sim_accel.load(std::memory_order_relaxed);
+        if (sim_on) {
+            int rate = g_cur_rate.load(std::memory_order_relaxed);
+            if (rate <= 0) rate = g_cfg.sim_rate_min.load(std::memory_order_relaxed);
+            if (rate > 0) {
+                double f = (double)rate / 60.0;
+                double t = (double)ev->timestamp * 1e-9;
+                double ph = 2.0 * M_PI * f * t;
+                double half = 0.0436;                       // ±2.5° 的一半
+                double qx = sin(half * sin(ph));
+                double qw = cos(half * sin(ph));
+                ev->data[0] = (float)qx;
+                ev->data[1] = 0.0f;
+                ev->data[2] = 0.0f;
+                ev->data[3] = (float)qw;
+                if (ev->type == ASENSOR_TYPE_ROTATION_VECTOR) {
+                    // data[4] 是预估航向精度（rad），保持小值表示姿态可信
+                    ev->data[4] = 0.05f;
+                }
+                g_patched_events.fetch_add(1, std::memory_order_relaxed);
+                g_rv_patched.fetch_add(1, std::memory_order_relaxed);
+                static std::atomic<long long> n_rv{0};
+                long long c = n_rv.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (c == 1) {
+                    LOGI("first rotation_vector patch: type=%d rate=%d pid=%d",
+                         ev->type, rate, getpid());
+                }
+            }
+        } else if (!g_rv_seen_simoff.exchange(true, std::memory_order_relaxed)) {
+            LOGI("rotation_vector event %d (%s) seen but sim off",
+                 ev->type, sensor_type_name(ev->type));
         }
     }
 }
@@ -317,7 +562,8 @@ static ssize_t hook_slot(void *a, ASensorEvent *events, size_t count) {
         g_hook_hits.fetch_add(1, std::memory_order_relaxed);
         static std::atomic<int> once{0};
         if (once.fetch_add(1) == 0) {
-            LOGI("slot[%d] first read: n=%zd type0=%d", I, n, events[0].type);
+            LOGI("slot[%d] first read: n=%zd type0=%d (%s)",
+                 I, n, events[0].type, sensor_type_name(events[0].type));
         }
         bool en = g_cfg.enabled.load(std::memory_order_relaxed);
         for (ssize_t i = 0; i < n; ++i) {
@@ -538,9 +784,24 @@ static void load_config_from_dir(int dir_fd) {
 }
 
 // ---------------------------------------------------------------------------
+// 多进程仿真步数同步（前置声明，sim_loop 用）
+// 闪动校园同时开好几个进程（主进程 + :push 之类），每个进程都有自己的一份
+// 模块副本、各自跑 sim_loop。若各自独立累加，同一时刻读同一个硬件计步器会得到
+// 互不相同的步数，跨进程一致性校验直接暴露。
+// 做法：每个进程按 pid 写自己的分片，读取时把所有分片求和，得到全局唯一的
+// 仿真步数序列——这样任何进程算出来的计步器曲线都完全一致。
+// ---------------------------------------------------------------------------
+static const char *CTL_SIMDIR = "/data/data/" TARGET_PKG_STR "/files/stepspoof_sim";
+static void sim_write_shard(long long steps, int rate);
+static long long sim_read_peers();
+static void sim_prune_shards();
+
+// ---------------------------------------------------------------------------
 // 步频仿真线程
 // 每 500ms tick：在 [min, max] 范围内随机取一个步频（步/分钟），
-// 换算为该 tick 应增加的步数（带小数累加），累加到 step_offset。
+// 换算为该 tick 应增加的步数（带小数累加）。
+// 仿真步数分为「本进程 local」+「其它进程分片之和 other」，对外暴露的
+// g_sim_steps 是两者之和，保证所有进程看到同一条步数曲线。
 // ---------------------------------------------------------------------------
 static void sim_loop() {
     LOGI("sim_loop started");
@@ -550,6 +811,8 @@ static void sim_loop() {
     constexpr int64_t TICK_MS = 500;
     bool prev_active = false;
     int picked = 0, picked_lo = -1, picked_hi = -1;
+    long long ticks = 0;
+    long long prune_tick = 0;
 
     for (;;) {
         usleep((useconds_t)(TICK_MS * 1000));
@@ -557,12 +820,44 @@ static void sim_loop() {
         bool active = g_cfg.sim_active.load(std::memory_order_relaxed)
                    && g_cfg.enabled.load(std::memory_order_relaxed);
 
+        if (active != prev_active) {
+            // 仿真状态翻转时复位「仿真未开启时已上报」标志，
+            // 否则一次 sim off → on → off 之后就再也看不到这类诊断行了
+            g_accel_seen_simoff.store(false, std::memory_order_relaxed);
+            g_cnt_seen_simoff.store(false, std::memory_order_relaxed);
+            g_gyro_seen_simoff.store(false, std::memory_order_relaxed);
+            g_rv_seen_simoff.store(false, std::memory_order_relaxed);
+            LOGI("sim state -> %s", active ? "ACTIVE" : "IDLE");
+        }
+
         int lo = g_cfg.sim_rate_min.load(std::memory_order_relaxed);
         int hi = g_cfg.sim_rate_max.load(std::memory_order_relaxed);
         if (lo < 0) lo = 0;
         if (hi < lo) hi = lo;
 
-        if (!active) { prev_active = false; continue; }
+        if (!active) {
+            if (prev_active) {
+                // 仿真由开转关：清掉锚定状态，下次开启重新锚定到当前硬件读数。
+                // 不清的话下次开启会沿用上一段跑步的基线，输出值凭空跳一大截。
+                if (g_base_valid.exchange(false, std::memory_order_relaxed)) {
+                    LOGI("sim off: baseline re-arm (last_out=%lld)",
+                         g_last_out.load(std::memory_order_relaxed));
+                }
+                g_cur_rate.store(0, std::memory_order_relaxed);
+                LOGI("sim loop idle: sim_steps total=%lld",
+                     g_sim_steps.load(std::memory_order_relaxed));
+            }
+            prev_active = false;
+            // 停止仿真时只清本进程的局部累加器和自己的分片（各进程独立，
+            // 非主进程不碰公共状态），保证下次开启从 0 重新累加，
+            // 上一段的步数不会被带进新一轮跑步。
+            g_local_steps.store(0, std::memory_order_relaxed);
+            g_sim_other.store(0, std::memory_order_relaxed);
+            g_sim_steps.store(0, std::memory_order_relaxed);
+            sim_accum = 0.0;
+            sim_write_shard(0, 0);
+            continue;
+        }
 
         // 步频稳定性（原设计关键）：只在「开始仿真」或「区间被改动」时取一次
         // 随机值并锁定。每 500ms 重随机会让步态周期抖动，自研计步器直接判成
@@ -586,7 +881,38 @@ static void sim_loop() {
         long long add = (long long)floor(sim_accum);
         if (add > 0) {
             sim_accum -= (double)add;
-            g_sim_steps.fetch_add(add, std::memory_order_relaxed);
+            g_local_steps.fetch_add(add, std::memory_order_relaxed);
+        }
+
+        // 每 tick 落一次分片，并汇总其它进程的仿真步数。
+        // 汇总放在 tick 内做（而不是只在心跳里做）是为了让步数曲线跟得上：
+        // 心跳 10 秒一次，中间 10 秒的跨进程差异足够被一致性校验抓到。
+        sim_write_shard(g_local_steps.load(std::memory_order_relaxed), picked);
+        long long other = sim_read_peers();
+        g_sim_other.store(other, std::memory_order_relaxed);
+        g_sim_steps.store(g_local_steps.load(std::memory_order_relaxed) + other,
+                          std::memory_order_relaxed);
+        if (++prune_tick % 40 == 0) sim_prune_shards();
+
+        // 心跳：每 10 秒（20 tick）打一行运行快照。
+        // 之前没有周期日志，设备 C 那 12 分钟的空白没法判断是「没在跑」还是
+        // 「在跑但没读传感器」，现在这一行直接给出答案。
+        if (++ticks % 20 == 0) {
+            LOGI("heartbeat: rate=%d local=%lld peers=%lld total=%lld "
+                 "hits=%lld patched=%lld "
+                 "accel=%lld/lp=%lld gyro=%lld/gp=%lld rv=%lld/rp=%lld "
+                 "stepdet=%lld stepcnt=%lld/cp=%lld procs=%d anchored=%d "
+                 "base_hw=%lld last_out=%lld",
+                 picked, g_local_steps.load(), g_sim_other.load(),
+                 g_sim_steps.load(), g_hook_hits.load(), g_patched_events.load(),
+                 g_type_cnt[ASENSOR_TYPE_ACCELEROMETER].load(), g_accel_patched.load(),
+                 g_type_cnt[ASENSOR_TYPE_GYROSCOPE].load(), g_gyro_patched.load(),
+                 g_type_cnt[ASENSOR_TYPE_ROTATION_VECTOR].load(), g_rv_patched.load(),
+                 g_type_cnt[ASENSOR_TYPE_STEP_DETECTOR].load(),
+                 g_type_cnt[ASENSOR_TYPE_STEP_COUNTER].load(), g_cnt_patched.load(),
+                 g_sim_peers.load(),
+                 g_base_valid.load() ? 1 : 0,
+                 g_hw_at_anchor.load(), g_last_out.load());
         }
     }
 }
@@ -599,6 +925,71 @@ static void sim_loop() {
 // ---------------------------------------------------------------------------
 static const char *CTL_CONF  = "/data/data/" TARGET_PKG_STR "/files/stepspoof.conf";
 static const char *CTL_STATE = "/data/data/" TARGET_PKG_STR "/files/stepspoof.state";
+
+// 把自己的分片写出去。文件名用 pid 区分，内容只有步数和步频两个数。
+static void sim_write_shard(long long steps, int rate) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%d", CTL_SIMDIR, getpid());
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+    if (fd < 0) return;
+    char b[64];
+    int n = snprintf(b, sizeof(b), "%lld %d\n", steps, rate);
+    (void)!write(fd, b, (size_t)n);
+    close(fd);
+}
+
+// 汇总所有分片。返回别的进程的步数之和，并统计分片数。
+static long long sim_read_peers() {
+    DIR *d = opendir(CTL_SIMDIR);
+    if (d == nullptr) {
+        if (mkdir(CTL_SIMDIR, 0777) != 0 && errno != EEXIST) return 0;
+        d = opendir(CTL_SIMDIR);
+        if (d == nullptr) return 0;
+    }
+    int self = getpid();
+    long long sum = 0;
+    int peers = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != nullptr) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        int pid = atoi(de->d_name);
+        if (pid <= 0) continue;
+        ++peers;
+        if (pid == self) continue;
+        char path[256];
+        snprintf(path, sizeof(path), "%s/%s", CTL_SIMDIR, de->d_name);
+        int fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0) continue;
+        char b[64] = {};
+        ssize_t r = read(fd, b, sizeof(b) - 1);
+        close(fd);
+        if (r > 0) sum += atoll(b);
+    }
+    closedir(d);
+    g_sim_peers.store(peers, std::memory_order_relaxed);
+    return sum;
+}
+
+// 清理已经不存在的进程留下的分片（进程被杀时来不及删）
+static void sim_prune_shards() {
+    DIR *d = opendir(CTL_SIMDIR);
+    if (d == nullptr) return;
+    int self = getpid();
+    struct dirent *de;
+    while ((de = readdir(d)) != nullptr) {
+        if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
+        int pid = atoi(de->d_name);
+        if (pid <= 0 || pid == self) continue;
+        char proc[64];
+        snprintf(proc, sizeof(proc), "/proc/%d", pid);
+        if (access(proc, F_OK) != 0) {
+            char path[256];
+            snprintf(path, sizeof(path), "%s/%s", CTL_SIMDIR, de->d_name);
+            unlink(path);
+        }
+    }
+    closedir(d);
+}
 
 static void apply_conf_text(char *buf) {
     char *save = nullptr;
@@ -620,20 +1011,31 @@ static void apply_conf_text(char *buf) {
 }
 
 static void write_state_file() {
-    char js[384];
+    char js[896];
     int n = snprintf(js, sizeof(js),
         "enabled=%d\noffset=%lld\nabsolute=%d\nabsolute_value=%lld\n"
         "sim_active=%d\nsim_min=%d\nsim_max=%d\nsim_accel=%d\n"
-        "hook_hits=%lld\npatched=%lld\nsim_steps=%lld\n"
-        "acc=%lld\ngyro=%lld\nstepdet=%lld\nstepcnt=%lld\n"
+        "hook_hits=%lld\npatched=%lld\nsim_steps=%lld\naccel_patched=%lld\n"
+        "gyro_patched=%lld\nrv_patched=%lld\ncnt_patched=%lld\n"
+        "local_steps=%lld\nother_steps=%lld\npeers=%d\n"
+        "anchored=%d\nbase_hw=%lld\nlast_out=%lld\n"
+        "acc=%lld\nlinacc=%lld\naccu=%lld\ngyro=%lld\nrv=%lld\n"
+        "stepdet=%lld\nstepcnt=%lld\n"
         "stride=%d\ncur_rate=%d\n",
         g_cfg.enabled.load() ? 1 : 0, g_cfg.step_offset.load(),
         g_cfg.absolute_mode.load() ? 1 : 0, g_cfg.absolute_value.load(),
         g_cfg.sim_active.load() ? 1 : 0, g_cfg.sim_rate_min.load(),
         g_cfg.sim_rate_max.load(), g_cfg.sim_accel.load() ? 1 : 0,
         g_hook_hits.load(), g_patched_events.load(), g_sim_steps.load(),
+        g_accel_patched.load(), g_gyro_patched.load(), g_rv_patched.load(),
+        g_cnt_patched.load(),
+        g_local_steps.load(), g_sim_other.load(), g_sim_peers.load(),
+        g_base_valid.load() ? 1 : 0, g_hw_at_anchor.load(), g_last_out.load(),
         g_type_cnt[ASENSOR_TYPE_ACCELEROMETER].load(),
+        g_type_cnt[ASENSOR_TYPE_LINEAR_ACCELERATION].load(),
+        g_type_cnt[ASENSOR_TYPE_ACCELEROMETER_UNCALIBRATED].load(),
         g_type_cnt[ASENSOR_TYPE_GYROSCOPE].load(),
+        g_type_cnt[ASENSOR_TYPE_ROTATION_VECTOR].load(),
         g_type_cnt[ASENSOR_TYPE_STEP_DETECTOR].load(),
         g_type_cnt[ASENSOR_TYPE_STEP_COUNTER].load(),
         g_cfg.stride_cm.load(), g_cur_rate.load());
@@ -643,17 +1045,22 @@ static void write_state_file() {
     close(fd);
 }
 
+// 主进程才有资格写状态文件，避免子进程互相覆盖
+static bool g_is_main_proc = false;
+
 static void conf_watch_loop() {
     LOGI("conf_watch started: %s", CTL_CONF);
     struct stat st {};
     off_t last_sz = -1;
     time_t last_mt = 0;
+    bool first = true;
 
     for (;;) {
         usleep(700 * 1000);
 
         if (stat(CTL_CONF, &st) == 0) {
-            if (st.st_size != last_sz || st.st_mtime != last_mt) {
+            if (first || st.st_size != last_sz || st.st_mtime != last_mt) {
+                first = false;
                 last_sz = st.st_size;
                 last_mt = st.st_mtime;
                 int fd = open(CTL_CONF, O_RDONLY | O_CLOEXEC);
@@ -673,7 +1080,7 @@ static void conf_watch_loop() {
             LOGW("conf stat failed: %s", strerror(errno));
         }
 
-        write_state_file();
+        if (g_is_main_proc) write_state_file();
     }
 }
 
@@ -737,13 +1144,17 @@ static void handle_client(int fd) {
     }
 
     if (method == "GET" && path == "/api/status") {
-        char js[1024];
+        char js[1800];
         snprintf(js, sizeof(js),
                  "{\"enabled\":%d,\"step_offset\":%lld,\"absolute_mode\":%d,"
                  "\"absolute_value\":%lld,\"sim_active\":%d,\"sim_rate_min\":%d,"
                  "\"sim_rate_max\":%d,\"hook_hits\":%lld,\"patched_events\":%lld,"
                  "\"sim_steps\":%lld,\"hooks\":%d,\"sim_accel\":%d,\"cur_rate\":%d,"
-                 "\"acc\":%lld,\"gyro\":%lld,\"stepdet\":%lld,\"stepcnt\":%lld,"
+                 "\"accel_patched\":%lld,\"gyro_patched\":%lld,\"rv_patched\":%lld,"
+                 "\"cnt_patched\":%lld,\"local_steps\":%lld,\"other_steps\":%lld,"
+                 "\"peers\":%d,\"anchored\":%d,\"base_hw\":%lld,\"last_out\":%lld,"
+                 "\"acc\":%lld,\"linacc\":%lld,\"accu\":%lld,"
+                 "\"gyro\":%lld,\"rv\":%lld,\"stepdet\":%lld,\"stepcnt\":%lld,"
                  "\"stride\":%d,\"speed_cmps\":%d,\"pkg\":\"%s\"}",
                  g_cfg.enabled.load() ? 1 : 0,
                  g_cfg.step_offset.load(),
@@ -755,8 +1166,15 @@ static void handle_client(int fd) {
                  g_hook_hits.load(), g_patched_events.load(),
                  g_sim_steps.load(), g_hook_cnt.load(),
                  g_cfg.sim_accel.load() ? 1 : 0, g_cur_rate.load(),
+                 g_accel_patched.load(), g_gyro_patched.load(), g_rv_patched.load(),
+                 g_cnt_patched.load(),
+                 g_local_steps.load(), g_sim_other.load(), g_sim_peers.load(),
+                 g_base_valid.load() ? 1 : 0, g_hw_at_anchor.load(), g_last_out.load(),
                  g_type_cnt[ASENSOR_TYPE_ACCELEROMETER].load(),
+                 g_type_cnt[ASENSOR_TYPE_LINEAR_ACCELERATION].load(),
+                 g_type_cnt[ASENSOR_TYPE_ACCELEROMETER_UNCALIBRATED].load(),
                  g_type_cnt[ASENSOR_TYPE_GYROSCOPE].load(),
+                 g_type_cnt[ASENSOR_TYPE_ROTATION_VECTOR].load(),
                  g_type_cnt[ASENSOR_TYPE_STEP_DETECTOR].load(),
                  g_type_cnt[ASENSOR_TYPE_STEP_COUNTER].load(),
                  g_cfg.stride_cm.load(),
@@ -779,11 +1197,14 @@ static void handle_client(int fd) {
         g_cfg.sim_rate_max.store((int)json_num(body, "sim_rate_max", g_cfg.sim_rate_max.load()));
         g_cfg.sim_accel.store(json_num(body, "sim_accel", g_cfg.sim_accel.load() ? 1 : 0) != 0);
         g_cfg.stride_cm.store((int)json_num(body, "stride", g_cfg.stride_cm.load()));
-        LOGI("cfg updated: en=%d off=%lld abs=%d val=%lld sim=%d min=%d max=%d",
+        LOGI("cfg updated: en=%d off=%lld abs=%d val=%lld sim=%d min=%d max=%d "
+             "acc=%d stride=%dcm pace=%d cm/s",
              g_cfg.enabled.load() ? 1 : 0, g_cfg.step_offset.load(),
              g_cfg.absolute_mode.load() ? 1 : 0, g_cfg.absolute_value.load(),
              g_cfg.sim_active.load() ? 1 : 0, g_cfg.sim_rate_min.load(),
-             g_cfg.sim_rate_max.load());
+             g_cfg.sim_rate_max.load(), g_cfg.sim_accel.load() ? 1 : 0,
+             g_cfg.stride_cm.load(),
+             g_cfg.sim_rate_max.load() * g_cfg.stride_cm.load() / 60);
         http_reply(fd, 200, "application/json", "{\"ok\":true}");
     } else if (method == "POST" && path == "/api/start") {
         g_cfg.enabled.store(true);
@@ -927,7 +1348,7 @@ public:
         }
 
         // 首个日志落盘，附带一次环境快照，便于他人排障
-        LOGI("===== stepspoof_joyrun v1.2.0 start pid=%d main=%d =====",
+        LOGI("===== stepspoof_joyrun v1.3.0 start pid=%d main=%d =====",
              getpid(), is_main ? 1 : 0);
         LOGI("log file: %s", g_log_path[0] ? g_log_path : "(not opened yet)");
 
@@ -936,12 +1357,15 @@ public:
             try_install_sensor_hook();
         }
 
-        // 仿真、WebUI、控制通道只在主进程起，子进程只挂 hook
+        // 仿真、控制通道在所有目标进程都起：真正读传感器的可能是子进程，
+        // 只给主进程起会导致子进程 sim_active 恒为 false，波形永远不注入。
+        // WebUI（占用 8888 端口）只在主进程起。
+        g_is_main_proc = is_main;
         if (is_main) {
             std::thread(webui_loop).detach();
-            std::thread(sim_loop).detach();
-            std::thread(conf_watch_loop).detach();
         }
+        std::thread(sim_loop).detach();
+        std::thread(conf_watch_loop).detach();
     }
 
 private:

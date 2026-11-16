@@ -156,16 +156,16 @@
   <div class="slider-block">
     <div class="slider-head">
       <span class="lbl">最低步频</span>
-      <span class="val" id="vMin">80</span>
+      <span class="val" id="vMin">135</span>
     </div>
-    <input type="range" id="sMin" min="40" max="240" value="80">
+    <input type="range" id="sMin" min="40" max="240" value="135">
   </div>
   <div class="slider-block">
     <div class="slider-head">
       <span class="lbl">最高步频</span>
-      <span class="val" id="vMax">120</span>
+      <span class="val" id="vMax">160</span>
     </div>
-    <input type="range" id="sMax" min="40" max="240" value="120">
+    <input type="range" id="sMax" min="40" max="240" value="160">
   </div>
   <div class="divider"></div>
   <div class="slider-block">
@@ -193,9 +193,18 @@
   <div class="kv"><span>已改写事件</span><b id="kPatched">-</b></div>
   <div class="kv"><span>仿真累计步数</span><b id="kSim">-</b></div>
   <div class="kv"><span>加速度事件</span><b id="kAcc">-</b></div>
+  <div class="kv"><span>加速度已改写</span><b id="kAccP">-</b></div>
+  <div class="kv"><span>线性加速度事件</span><b id="kLin">-</b></div>
+  <div class="kv"><span>未校准加速度事件</span><b id="kAccu">-</b></div>
+  <div class="kv"><span>陀螺仪事件</span><b id="kGyro">-</b></div>
+  <div class="kv"><span>陀螺仪已改写</span><b id="kGyroP">-</b></div>
+  <div class="kv"><span>旋转矢量事件</span><b id="kRv">-</b></div>
+  <div class="kv"><span>旋转矢量已改写</span><b id="kRvP">-</b></div>
   <div class="kv"><span>计步检测事件 STD 0x12</span><b id="kDet">-</b></div>
   <div class="kv"><span>步数累计传感器 STC 0x13</span><b id="kCnt">-</b></div>
-  <div class="hint">STD/STC 仅在 App 注册硬件计步器时才会计数。闪动校园用 400Hz 加速度自算步数，这两项恒为 0 属正常现象，看「加速度事件」即可。</div>
+  <div class="kv"><span>STC 已改写</span><b id="kCntP">-</b></div>
+  <div class="kv"><span>进程数（步数同步）</span><b id="kPeers">-</b></div>
+  <div class="hint">STD/STC 仅在 App 注册硬件计步器时才会计数。闪动校园用 400Hz 加速度自算步数，这两项恒为 0 属正常现象，看「加速度事件」即可。陀螺仪/旋转矢量随加速度同步注入（同频同相），避免多传感器一致性校验判成作弊。</div>
 </div>
 
 <div class="card">
@@ -210,14 +219,14 @@
   <div class="hint">日志同时写入 logcat 与上述文件，超过 2MB 自动轮转为 .old。手机自带文件管理器打开「下载」目录即可找到，无需电脑。排障时先点「打标记」，再复现问题，最后把文件发出来。</div>
 </div>
 
-<div class="footer">stepspoof_joyrun v1.2.0</div>
+<div class="footer">stepspoof_joyrun v1.3.0</div>
 <div class="toast" id="toast"></div>
 
 <script>
 const PKG  = 'com.huachenjie.shandong_school';
 const CONF = '/data/data/' + PKG + '/files/stepspoof.conf';
 
-let S = {enabled:true, sim_active:false, sim_rate_min:80, sim_rate_max:120, sim_accel:true, stride:110};
+let S = {enabled:true, sim_active:false, sim_rate_min:135, sim_rate_max:160, sim_accel:true, stride:110};
 let online = false;
 
 function toast(msg){
@@ -321,8 +330,17 @@ function render(st){
     document.getElementById('kPatched').textContent = st.patched_events ?? '-';
     document.getElementById('kSim').textContent     = st.sim_steps ?? '-';
     document.getElementById('kAcc').textContent     = st.acc ?? '-';
+    document.getElementById('kAccP').textContent    = st.accel_patched ?? '-';
+    document.getElementById('kLin').textContent     = st.linacc ?? '-';
+    document.getElementById('kAccu').textContent    = st.accu ?? '-';
+    document.getElementById('kGyro').textContent    = st.gyro ?? '-';
+    document.getElementById('kGyroP').textContent   = st.gyro_patched ?? '-';
+    document.getElementById('kRv').textContent      = st.rv ?? '-';
+    document.getElementById('kRvP').textContent     = st.rv_patched ?? '-';
     document.getElementById('kDet').textContent     = st.stepdet ?? '-';
     document.getElementById('kCnt').textContent     = st.stepcnt ?? '-';
+    document.getElementById('kCntP').textContent    = st.cnt_patched ?? '-';
+    document.getElementById('kPeers').textContent   = st.peers ?? '-';
   }
 }
 
@@ -346,8 +364,8 @@ async function load(){
       const k=line.slice(0,i).trim(), v=line.slice(i+1).trim();
       if(k==='enabled') S.enabled = v==='1';
       else if(k==='sim_active') S.sim_active = v==='1';
-      else if(k==='sim_min') S.sim_rate_min = Math.max(40,Math.min(240,parseInt(v)||80));
-      else if(k==='sim_max') S.sim_rate_max = Math.max(40,Math.min(240,parseInt(v)||120));
+      else if(k==='sim_min') S.sim_rate_min = Math.max(40,Math.min(240,parseInt(v)||135));
+      else if(k==='sim_max') S.sim_rate_max = Math.max(40,Math.min(240,parseInt(v)||160));
       else if(k==='sim_accel') S.sim_accel = v==='1';
       else if(k==='stride') S.stride = Math.max(60,Math.min(150,parseInt(v)||110));
     }
@@ -396,17 +414,30 @@ document.getElementById('chkAccel').addEventListener('change',async function(){
   toast(S.sim_accel?'加速度仿真已开启':'加速度仿真已关闭');
 });
 
+// 两个滑条互相推动：拖最小值超过最大值时把最大值一起顶上去，反之亦然。
+// 旧实现是把自己的值夹回去，拖一下区间就被压成单值（135-135），
+// 步频区间退化成定值，设备 A 的日志就是这么来的。
 document.getElementById('sMin').addEventListener('input',function(){
   let v=parseInt(this.value);
-  if(v>S.sim_rate_max){v=S.sim_rate_max;this.value=v;}
-  S.sim_rate_min=v;document.getElementById('vMin').textContent=v;
+  S.sim_rate_min=v;
+  if(S.sim_rate_max<v){
+    S.sim_rate_max=v;
+    document.getElementById('sMax').value=v;
+    document.getElementById('vMax').textContent=v;
+  }
+  document.getElementById('vMin').textContent=v;
 });
 document.getElementById('sMin').addEventListener('change',()=>save());
 
 document.getElementById('sMax').addEventListener('input',function(){
   let v=parseInt(this.value);
-  if(v<S.sim_rate_min){v=S.sim_rate_min;this.value=v;}
-  S.sim_rate_max=v;document.getElementById('vMax').textContent=v;
+  S.sim_rate_max=v;
+  if(S.sim_rate_min>v){
+    S.sim_rate_min=v;
+    document.getElementById('sMin').value=v;
+    document.getElementById('vMin').textContent=v;
+  }
+  document.getElementById('vMax').textContent=v;
 });
 document.getElementById('sMax').addEventListener('change',()=>save());
 
