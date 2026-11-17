@@ -8,7 +8,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$ROOT/build"
 DIST="$ROOT/dist"
 MODID="stepspoof_joyrun"
-VER="v1.3.1"
+VER="v1.3.4"
 
 echo "[*] NDK   = $NDK"
 echo "[*] ROOT  = $ROOT"
@@ -44,6 +44,13 @@ cp "$ROOT/module.prop" "$STAGE/module.prop"
 cp "$ROOT/META-INF/com/google/android/update-binary" "$STAGE/META-INF/com/google/android/"
 cp "$ROOT/META-INF/com/google/android/updater-script" "$STAGE/META-INF/com/google/android/"
 cp "$SO" "$STAGE/zygisk/arm64-v8a.so"
+
+# 开机脚本：把 user 0 的配置同步到应用双开（999 空间）
+if [ -f "$ROOT/service.sh" ]; then
+  cp "$ROOT/service.sh" "$STAGE/service.sh"
+  chmod 0755 "$STAGE/service.sh"
+  echo "[*] service.sh included"
+fi
 
 # KSU WebUI
 if [ -d "$ROOT/webroot" ]; then

@@ -1,4 +1,4 @@
-// stepspoof_joyrun v1.3.1 — 纯 native Zygisk 模块
+// stepspoof_joyrun v1.3.4 — 纯 native Zygisk 模块
 // 目标：com.huachenjie.shandong_school（闪动校园）
 // 功能：
 //   1) 加速度波形仿真（FuckRun 设计：X=0, Y=1.5·cos, Z=9.81+3.5·sin）
@@ -16,6 +16,7 @@
 //   5) 运行日志：同时写 logcat 与 /sdcard/Download/stepspoof_joyrun.log
 //      （2MB 自动轮转到 .old；/sdcard 不可写时降级到 App 私有目录）
 //      每行带 pid；每 10 秒一行 heartbeat 快照；每种传感器类型首次出现报一次。
+//      v1.3.4 起启动横幅带日期与设备名称/指纹，多台设备的日志可区分。
 //   6) 本地 HTTP API（127.0.0.1:8888）供 KSU WebUI 通过 root shell nc 访问
 //   7) conf_watch_loop：轮询 App 私有目录 stepspoof.conf，断连后持久化生效
 // 不依赖 LSPosed / 不建 ClassLoader / 不加载内存 dex。
@@ -55,12 +56,78 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <sys/system_properties.h>
 #include <unistd.h>
 
 #define LOG_TAG "stepspoof"
 
 // 目标包名（日志降级路径、控制通道路径都依赖它，必须在最前定义）
 #define TARGET_PKG_STR "com.huachenjie.shandong_school"
+
+// ---------------------------------------------------------------------------
+// 设备标识（v1.3.4）
+// 日志 banner 里带上「设备名称 + 系统指纹」，多台设备导出的日志才分得清。
+// 只读公开系统属性：品牌、型号、Android 版本、SDK、ABI、ro.build.fingerprint。
+// 不含序列号 / IMEI / ANDROID_ID / MAC，不引入新的个人标识。
+// fp8 是 ro.build.fingerprint 的 8 位哈希，标识「ROM 身份」而非单机——同型号
+// 同版本的两台机器哈希相同，这是刻意的；完整 fingerprint 同时写一行，便于核对。
+// ---------------------------------------------------------------------------
+struct DeviceInfo {
+    char name[128];      // "Xiaomi 23054RA19C"
+    char android[64];    // "Android 15 (SDK 35)"
+    char abi[64];        // "arm64-v8a"
+    char fp8[16];        // "8f3a21c7"
+    char fp_full[PROP_VALUE_MAX + 8];
+};
+
+static void prop_get(const char *key, char *buf, size_t n) {
+    if (!buf || n == 0) return;
+    buf[0] = 0;
+    if (!key || !key[0]) return;
+    char tmp[PROP_VALUE_MAX + 8] = {0};
+    int len = __system_property_get(key, tmp);
+    if (len <= 0) return;
+    if ((size_t)len >= n) len = (int)n - 1;
+    memcpy(buf, tmp, (size_t)len);
+    buf[len] = 0;
+}
+
+// 一次性读取并缓存，之后所有线程共用只读快照
+static const DeviceInfo &device_info() {
+    static DeviceInfo d {};
+    static std::atomic<int> once{0};
+    if (!once.exchange(1)) {
+        char brand[64] = {0}, model[64] = {0};
+        char rel[32] = {0}, sdk[32] = {0}, abi[64] = {0};
+
+        prop_get("ro.product.brand", brand, sizeof(brand));
+        prop_get("ro.product.model", model, sizeof(model));
+        if (!model[0]) prop_get("ro.product.name", model, sizeof(model));
+        if (brand[0] && model[0]) snprintf(d.name, sizeof(d.name), "%s %s", brand, model);
+        else if (model[0]) snprintf(d.name, sizeof(d.name), "%s", model);
+        else snprintf(d.name, sizeof(d.name), "unknown");
+
+        prop_get("ro.build.version.release", rel, sizeof(rel));
+        prop_get("ro.build.version.sdk", sdk, sizeof(sdk));
+        if (rel[0] && sdk[0]) snprintf(d.android, sizeof(d.android), "Android %s (SDK %s)", rel, sdk);
+        else if (rel[0]) snprintf(d.android, sizeof(d.android), "Android %s", rel);
+        else snprintf(d.android, sizeof(d.android), "unknown");
+
+        prop_get("ro.product.cpu.abi", abi, sizeof(abi));
+        snprintf(d.abi, sizeof(d.abi), "%s", abi[0] ? abi : "?");
+
+        prop_get("ro.build.fingerprint", d.fp_full, sizeof(d.fp_full));
+        unsigned int h = 2166136261u;   // FNV-1a 32
+        const char *src = d.fp_full[0] ? d.fp_full : (rel[0] ? rel : "unknown");
+        for (const char *p = src; *p; ++p) {
+            h ^= (unsigned char)*p;
+            h *= 16777619u;
+        }
+        if (h == 0) h = 1;              // 全 0 留作「未知」占位
+        snprintf(d.fp8, sizeof(d.fp8), "%08x", h);
+    }
+    return d;
+}
 
 // ---------------------------------------------------------------------------
 // 日志：同时输出到 logcat 与文件
@@ -162,22 +229,26 @@ static void log_v(int prio, const char *fmt, va_list ap) {
     log_close_and_rotate_if_needed();
 }
 
-#if defined(__clang__)
-#define LOGFMT(fmt_idx) __attribute__((format(printf, fmt_idx, fmt_idx + 1)))
+// format 属性要写在声明最前面。原先写成 "void log_d(...) LOGFMT(1) {"
+// 是 clang 才认的位置，GCC 前端会报 -Wgcc-compat 说这里不允许。
+#if defined(__clang__) || defined(__GNUC__)
+#define LOGFMT __attribute__((format(printf, 1, 2)))
 #else
-#define LOGFMT(fmt_idx)
+#define LOGFMT
 #endif
+// LOGD 目前没有调用点，留着方便以后临时加调试输出，显式标记避免 unused 告警
+#define LOGD_UNUSED __attribute__((unused))
 
-static void log_d(const char *fmt, ...) LOGFMT(1) {
+LOGFMT LOGD_UNUSED static void log_d(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); log_v(ANDROID_LOG_DEBUG, fmt, ap); va_end(ap);
 }
-static void log_i(const char *fmt, ...) LOGFMT(1) {
+LOGFMT static void log_i(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); log_v(ANDROID_LOG_INFO, fmt, ap); va_end(ap);
 }
-static void log_w(const char *fmt, ...) LOGFMT(1) {
+LOGFMT static void log_w(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); log_v(ANDROID_LOG_WARN, fmt, ap); va_end(ap);
 }
-static void log_e(const char *fmt, ...) LOGFMT(1) {
+LOGFMT static void log_e(const char *fmt, ...) {
     va_list ap; va_start(ap, fmt); log_v(ANDROID_LOG_ERROR, fmt, ap); va_end(ap);
 }
 
@@ -229,6 +300,11 @@ static std::atomic<long long> g_sim_other{0};
 static std::atomic<int> g_sim_peers{0};
 // 主进程才有资格写状态文件、决定共享步频、累加全局步数
 static bool g_is_main_proc = false;
+// WebUI 实际绑定成功的端口。双开时后启动的实例会顺延到 8889 及以后，
+// 前端靠 /api/status 的 port 字段自动发现该连哪个口。
+static constexpr int kWebuiPortBase = 8888;
+static constexpr int kWebuiPortSpan = 10;
+static std::atomic<int> g_webui_port{0};
 // 当前瞬时目标步频（步/分钟），由 sim_loop 刷新，供加速度波形合成使用
 static std::atomic<int> g_cur_rate{0};
 // 事件类型直方图（诊断：看清 App 到底收哪些传感器）
@@ -242,6 +318,39 @@ static int64_t mono_ms() {
     struct timespec ts {};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// 本进程的 cmdline basename，比如 "com.huachenjie.shandong_school" 或
+// "com.huachenjie.shandong_school:push"。WebUI 的实例下拉框靠它区分
+// 同一个空间里被注入的多个进程——它们 uid 相同，只有进程名不同。
+static const char *proc_name() {
+    static char name[128] = {};
+    static std::atomic<int> once{0};
+    if (once.exchange(1)) return name;
+    int fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) {
+        char b[256] = {};
+        ssize_t r = read(fd, b, sizeof(b) - 1);
+        close(fd);
+        if (r > 0) {
+            b[r] = 0;
+            // cmdline 以 \0 分隔，第一个字段就是主 cmdline
+            const char *slash = strrchr(b, '/');
+            snprintf(name, sizeof(name), "%s", slash ? slash + 1 : b);
+        }
+    }
+    if (!name[0]) snprintf(name, sizeof(name), "%s", TARGET_PKG);
+    return name;
+}
+
+// 本进程已经收到过多少种传感器类型的事件。0 表示这个进程根本没在读传感器，
+// 实例列表里优先选非 0 的那个。
+static int active_sensor_types() {
+    int n = 0;
+    for (int i = 0; i < kTypeSlots; i++) {
+        if (g_type_seen[i].load(std::memory_order_relaxed)) n++;
+    }
+    return n;
 }
 
 static const char *sensor_type_name(int t) {
@@ -845,6 +954,11 @@ static void sim_loop() {
             g_cnt_seen_simoff.store(false, std::memory_order_relaxed);
             g_gyro_seen_simoff.store(false, std::memory_order_relaxed);
             g_rv_seen_simoff.store(false, std::memory_order_relaxed);
+            // 心跳基线必须跟着复位：g_local_steps 在 IDLE 时会清零，而
+            // hb_last_steps 还留着上一段的终值，两者相减就是负数（日志3 里
+            // rate=138 meas=-75 就是这么来的）。
+            hb_last_steps = 0;
+            hb_last_ms = 0;
             LOGI("sim state -> %s", active ? "ACTIVE" : "IDLE");
         }
 
@@ -959,8 +1073,11 @@ static void sim_loop() {
             int meas = 0;
             if (hb_last_ms > 0) {
                 double span = (double)(now - hb_last_ms) / 1000.0;
-                if (span > 0.5) meas = (int)((double)(cur - hb_last_steps) * 60.0 / span + 0.5);
+                long long delta = cur - hb_last_steps;
+                if (span > 0.5) meas = (int)((double)delta * 60.0 / span + 0.5);
             }
+            // 首条心跳或刚复位时 hb_last_ms=0，meas 无意义，只打实测值不打 0
+            if (hb_last_ms == 0 || !active) meas = -1;
             hb_last_ms = now;
             hb_last_steps = cur;
             LOGI("heartbeat: rate=%d meas=%d this_steps=%lld all_steps=%lld procs=%d "
@@ -1147,6 +1264,58 @@ static void apply_conf_text(char *buf) {
         else if (!strcmp(k, "sim_accel")) g_cfg.sim_accel.store(atoi(v) != 0);
         else if (!strcmp(k, "stride")) g_cfg.stride_cm.store(atoi(v) > 0 ? atoi(v) : 110);
     }
+    // 兜底：区间反了就交换。写端（WebUI 拖动、conf 手改、多进程并发写）都可能
+    // 出现 min > max 的瞬间，不修的话 sim_loop 里的 rand 区间为负，步频会算出
+    // 离谱值或直接卡住。
+    int lo = g_cfg.sim_rate_min.load(), hi = g_cfg.sim_rate_max.load();
+    if (lo > hi) { g_cfg.sim_rate_min.store(hi); g_cfg.sim_rate_max.store(lo); }
+}
+
+// 把当前配置写回 CTL_CONF。
+// 关键：这段代码跑在目标 App 进程里，"/data/data/<pkg>" 会按进程自己的 user
+// 解析（user 0 → /data/user/0，999 空间 → /data/user/999），天然写对沙盒。
+// WebUI 的 persist() 走 ksu.exec 起的是全局 root shell，那里的 /data/data
+// 恒等于 /data/user/0，所以从 999 空间打开 WebUI 也只会写进 user 0，
+// 999 空间的主进程永远读不到自己的 conf。写端必须落到进程内部。
+static void save_conf_native() {
+    std::string txt;
+    txt += "enabled=" + std::to_string(g_cfg.enabled.load() ? 1 : 0) + "\n";
+    txt += "offset=" + std::to_string(g_cfg.step_offset.load()) + "\n";
+    txt += "absolute=" + std::to_string(g_cfg.absolute_mode.load() ? 1 : 0) + "\n";
+    txt += "absolute_value=" + std::to_string(g_cfg.absolute_value.load()) + "\n";
+    txt += "sim_active=" + std::to_string(g_cfg.sim_active.load() ? 1 : 0) + "\n";
+    txt += "sim_min=" + std::to_string(g_cfg.sim_rate_min.load()) + "\n";
+    txt += "sim_max=" + std::to_string(g_cfg.sim_rate_max.load()) + "\n";
+    txt += "sim_accel=" + std::to_string(g_cfg.sim_accel.load() ? 1 : 0) + "\n";
+    txt += "stride=" + std::to_string(g_cfg.stride_cm.load()) + "\n";
+
+    // 原子替换：先写同目录临时文件，fsync 落盘后再 rename 覆盖正式文件。
+    // 同一空间里可能有多个进程（主进程 + :push 等）都在写 conf，也可能和
+    // service.sh 的拷贝撞上。直接 O_TRUNC 覆写会让 conf_watch_loop 在
+    // 截断与写完之间读到 0 字节或半截内容，配置被当成"无效"跳过甚至重置。
+    // 同文件系统内 rename 是原子的，读端要么看到旧文件、要么看到新文件。
+    std::string tmp = std::string(CTL_CONF) + ".tmp." + std::to_string(getpid());
+    int fd = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+    if (fd < 0) {
+        LOGW("save_conf_native open failed: %s", strerror(errno));
+        return;
+    }
+    ssize_t wr = write(fd, txt.data(), txt.size());
+    if (wr < 0 || (size_t)wr != txt.size()) {
+        LOGW("save_conf_native write failed: %s", strerror(errno));
+        close(fd);
+        unlink(tmp.c_str());
+        return;
+    }
+    fsync(fd);
+    close(fd);
+    chmod(tmp.c_str(), 0666);
+    if (rename(tmp.c_str(), CTL_CONF) != 0) {
+        LOGW("save_conf_native rename failed: %s", strerror(errno));
+        unlink(tmp.c_str());
+        return;
+    }
+    LOGI("conf written from native (%zu bytes)", txt.size());
 }
 
 static void write_state_file() {
@@ -1282,7 +1451,7 @@ static void handle_client(int fd) {
     }
 
     if (method == "GET" && path == "/api/status") {
-        char js[1800];
+        char js[2048];
         snprintf(js, sizeof(js),
                  "{\"enabled\":%d,\"step_offset\":%lld,\"absolute_mode\":%d,"
                  "\"absolute_value\":%lld,\"sim_active\":%d,\"sim_rate_min\":%d,"
@@ -1293,7 +1462,8 @@ static void handle_client(int fd) {
                  "\"peers\":%d,\"anchored\":%d,\"base_hw\":%lld,\"last_out\":%lld,"
                  "\"acc\":%lld,\"linacc\":%lld,\"accu\":%lld,"
                  "\"gyro\":%lld,\"rv\":%lld,\"stepdet\":%lld,\"stepcnt\":%lld,"
-                 "\"stride\":%d,\"speed_cmps\":%d,\"pkg\":\"%s\"}",
+                 "\"stride\":%d,\"speed_cmps\":%d,\"pkg\":\"%s\","
+                 "\"port\":%d,\"uid\":%d,\"proc\":\"%s\",\"sensors\":%d}",
                  g_cfg.enabled.load() ? 1 : 0,
                  g_cfg.step_offset.load(),
                  g_cfg.absolute_mode.load() ? 1 : 0,
@@ -1317,7 +1487,9 @@ static void handle_client(int fd) {
                  g_type_cnt[ASENSOR_TYPE_STEP_COUNTER].load(),
                  g_cfg.stride_cm.load(),
                  (int)((long long)g_cur_rate.load() * g_cfg.stride_cm.load() / 60),
-                 TARGET_PKG);
+                 TARGET_PKG,
+                 g_webui_port.load(), (int)getuid(),
+                 proc_name(), active_sensor_types());
         http_reply(fd, 200, "application/json", js);
     } else if (method == "POST" && path == "/api/config") {
         size_t body_at = req.find("\r\n\r\n");
@@ -1333,8 +1505,13 @@ static void handle_client(int fd) {
         g_cfg.sim_active.store(json_num(body, "sim_active", g_cfg.sim_active.load() ? 1 : 0) != 0);
         g_cfg.sim_rate_min.store((int)json_num(body, "sim_rate_min", g_cfg.sim_rate_min.load()));
         g_cfg.sim_rate_max.store((int)json_num(body, "sim_rate_max", g_cfg.sim_rate_max.load()));
+        {
+            int lo = g_cfg.sim_rate_min.load(), hi = g_cfg.sim_rate_max.load();
+            if (lo > hi) { g_cfg.sim_rate_min.store(hi); g_cfg.sim_rate_max.store(lo); }
+        }
         g_cfg.sim_accel.store(json_num(body, "sim_accel", g_cfg.sim_accel.load() ? 1 : 0) != 0);
         g_cfg.stride_cm.store((int)json_num(body, "stride", g_cfg.stride_cm.load()));
+        save_conf_native();
         LOGI("cfg updated: enabled=%d offset=%lld absolute=%d abs_value=%lld "
              "sim_active=%d min=%d max=%d sim_accel=%d stride=%dcm pace=%d cm/s",
              g_cfg.enabled.load() ? 1 : 0, g_cfg.step_offset.load(),
@@ -1347,6 +1524,7 @@ static void handle_client(int fd) {
     } else if (method == "POST" && path == "/api/start") {
         g_cfg.enabled.store(true);
         g_cfg.sim_active.store(true);
+        save_conf_native();
         LOGI("sim started: min=%d max=%d", g_cfg.sim_rate_min.load(), g_cfg.sim_rate_max.load());
         http_reply(fd, 200, "application/json", "{\"ok\":true,\"sim_active\":true}");
     } else if (method == "GET" && path == "/api/log") {
@@ -1377,6 +1555,7 @@ static void handle_client(int fd) {
         http_reply(fd, 200, "application/json", "{\"ok\":true}");
     } else if (method == "POST" && path == "/api/stop") {
         g_cfg.sim_active.store(false);
+        save_conf_native();
         LOGI("sim stopped");
         http_reply(fd, 200, "application/json", "{\"ok\":true,\"sim_active\":false}");
     } else {
@@ -1392,19 +1571,35 @@ static void webui_loop() {
     int opt = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
+    // 端口不能写死 8888：双开时 user 0 和 999 空间各有一个主进程都想绑它，
+    // 后启动的那个 bind 失败就直接放弃了（日志里 18:22:57.504 与 11:12:34.077
+    // 两条 "bind 8888: Address already in use"）。它绑不上就没有 WebUI，
+    // 也就永远收不到 /api/start，整个 999 空间实例等于死的。
+    // 改成从 8888 往后顺延，绑上哪个用哪个，由 /api/status 的 port 字段告知前端。
+    int bound_port = 0;
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(8888);
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-
-    if (bind(srv, (sockaddr *)&addr, sizeof(addr)) != 0) {
-        LOGE("bind 8888: %s", strerror(errno));
+    for (int p = kWebuiPortBase; p < kWebuiPortBase + kWebuiPortSpan; ++p) {
+        addr.sin_port = htons((unsigned short)p);
+        if (bind(srv, (sockaddr *)&addr, sizeof(addr)) == 0) { bound_port = p; break; }
+        if (errno != EADDRINUSE) {
+            LOGE("bind %d: %s", p, strerror(errno));
+            close(srv);
+            return;
+        }
+    }
+    if (bound_port == 0) {
+        LOGE("bind %d-%d: %s", kWebuiPortBase, kWebuiPortBase + kWebuiPortSpan - 1,
+             strerror(errno));
         close(srv);
         return;
     }
+    g_webui_port.store(bound_port, std::memory_order_relaxed);
+
     if (listen(srv, 8) != 0) { LOGE("listen: %s", strerror(errno)); close(srv); return; }
 
-    LOGI("webui listening on 127.0.0.1:8888");
+    LOGI("webui listening on 127.0.0.1:%d (uid=%d)", bound_port, getuid());
 
     for (;;) {
         int c = accept4(srv, nullptr, nullptr, SOCK_CLOEXEC);
@@ -1485,9 +1680,26 @@ public:
             return;
         }
 
-        // 首个日志落盘，附带一次环境快照，便于他人排障
-        LOGI("===== stepspoof_joyrun v1.3.1 start pid=%d main=%d =====",
-             getpid(), is_main ? 1 : 0);
+        // 首个日志落盘，附带一次环境快照，便于他人排障。
+        // 时间戳带日期（行内时间戳只有时分秒，跨天无法定位是哪一天）；
+        // 再跟设备名称与指纹，多台设备的日志才不会互相混淆。
+        char when[32];
+        struct timespec ts {};
+        clock_gettime(CLOCK_REALTIME, &ts);
+        struct tm tmv {};
+        time_t secs = ts.tv_sec;
+        localtime_r(&secs, &tmv);
+        snprintf(when, sizeof(when), "%04d-%02d-%02d %02d:%02d:%02d",
+                 tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                 tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
+
+        const DeviceInfo &dev = device_info();
+        LOGI("===== stepspoof_joyrun v1.3.4 start %s pid=%d main=%d =====",
+             when, getpid(), is_main ? 1 : 0);
+        LOGI("device: %s | %s | %s", dev.name, dev.android, dev.abi);
+        LOGI("device fingerprint: %s", dev.fp8);
+        LOGI("device fingerprint full: %s",
+             dev.fp_full[0] ? dev.fp_full : "(unavailable)");
         LOGI("log file: %s", g_log_path[0] ? g_log_path : "(not opened yet)");
 
         // PLT hook 没打上时，尝试 inline hook（Android 14+ 路径）

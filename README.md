@@ -28,6 +28,8 @@ KernelSU Manager → 模块 → 打开 WebUI。
 
 设置步频区间（如 172–182 spm），点击开始仿真，随后正常跑步即可。
 
+双开或工作资料里两个实例各自独立控制。后启动的实例 WebUI 端口从 8888 顺延到 8889 及以后，页面顶部可在实例间切换。
+
 ## 日志
 
 日志同时写 logcat 和文件，默认在手机「下载」目录：
@@ -38,7 +40,18 @@ KernelSU Manager → 模块 → 打开 WebUI。
 
 超过 2MB 自动轮转为 `.old`。WebUI 底部「运行日志」卡片可看路径、打标记、复制、清空。
 
-看两个地方就够：`sensor type N (名字) first seen` 说明 App 读了哪些传感器；`heartbeat` 每 10 秒一行，`rate` 是设定步频，`meas` 是实测步频，对不上就是没按设定跑。
+每次 App 启动写一段头部，带日期、进程号、设备名称与指纹：
+
+```
+===== stepspoof_joyrun v1.3.4 start 2026-11-17 20:29:41 pid=13750 main=1 =====
+device: Xiaomi 123456abcd | Android 15 (SDK 35) | arm64-v8a
+device fingerprint: 8f3a21c7
+device fingerprint full: Xiaomi/pearl/pearl:15/AQ3A.240812.001/V816.0.3.0:user/release-keys
+```
+
+指纹是 `ro.build.fingerprint` 的 8 位哈希，标识 ROM 而不是单机，同型号同版本的两台设备哈希相同。日志中不含序列号、IMEI、Android ID 或 MAC。
+
+看两个地方就够：`sensor type N (名字) first seen` 说明 App 读了哪些传感器；`heartbeat` 每 10 秒一行，`rate` 是设定步频，`meas` 是实测步频，对不上就是没按设定跑（`meas=-1` 表示该周期仿真停过）。
 
 ## 兼容
 
@@ -48,6 +61,9 @@ KernelSU Manager → 模块 → 打开 WebUI。
 
 ## 更新
 
+- **v1.3.4** 日志头部带日期、设备名称与指纹
+- **v1.3.3** 双开两实例独立控制；WebUI 切换实例；修复步频滑条被状态轮询覆盖
+- **v1.3.2** WebUI 端口自动顺延；修复心跳实测步频出现负数
 - **v1.3.1** 修复多进程步频不统一
 - **v1.3.0** 新增陀螺仪/旋转矢量注入与步数基线锚定，多进程步数统一汇总
 - **v1.2.0** 运行日志落盘到下载目录
