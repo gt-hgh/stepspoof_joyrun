@@ -30,41 +30,15 @@ KernelSU Manager → 模块 → 打开 WebUI。
 
 ## 日志
 
-模块运行日志同时写入 logcat 和文件，默认路径：
+日志同时写 logcat 和文件，默认在手机「下载」目录：
 
 ```
 /sdcard/Download/stepspoof_joyrun.log
 ```
 
-手机文件管理器打开「下载」目录即可取到，不需要电脑。超过 2MB 自动轮转为 `.old`。`/sdcard` 不可写时降级到 `/data/data/com.huachenjie.shandong_school/files/stepspoof.log`。
+超过 2MB 自动轮转为 `.old`。WebUI 底部「运行日志」卡片可看路径、打标记、复制、清空。
 
-WebUI 底部「运行日志」卡片显示实际路径与大小，提供三个按钮：打标记（在日志里插一行方便定位）、复制日志（最近 200KB）、清空。
-
-排障流程：点「打标记」→ 复现问题 → 点「复制日志」或直接取文件。
-
-日志里几个关键行（用来判断卡在哪一步）：
-
-| 日志行 | 含义 |
-|---|---|
-| `sensor hooks installed: 3` | 注入成功，三条 hook 都挂上了 |
-| `sensor type N (名字) first seen` | App 到底读了哪些传感器类型，这是判断能否注入的唯一依据 |
-| `accel event 1 (ACCELEROMETER) seen but sim off` | App 在读加速度，但你还没点开始仿真 |
-| `first accel patch: type=1 ...` | 波形已经写进去了，链路通了 |
-| `first accel patch` 一直不出现，但 heartbeat 的 `acc` 在涨 | App 在读加速度，但走的是没被 hook 的独立路径 |
-| `gyro patch #N` / `rv patch #N` | 陀螺仪、旋转矢量也在改写 |
-| `sim state -> ACTIVE` / `IDLE` | 仿真线程启停，ACTIVE 之后才会有波形 |
-| `heartbeat: ...` | 每 10 秒一行运行快照，看 `sim_steps` 是否在涨 |
-| `cfg updated: ... acc=1` | 配置下发成功，`acc` 是加速度仿真开关 |
-| `sim cadence locked: N spm` | 本次仿真锁定的步频（开启时随机一次，全程不变） |
-
-所有日志行都带 `pid=`，多进程时能分清是哪条进程。
-
-需要电脑时：
-
-```bash
-adb logcat -s stepspoof              # 实时看
-adb pull /sdcard/Download/stepspoof_joyrun.log
-```
+看两个地方就够：`sensor type N (名字) first seen` 说明 App 读了哪些传感器；`heartbeat` 每 10 秒一行，`rate` 是设定步频，`meas` 是实测步频，对不上就是没按设定跑。
 
 ## 兼容
 
@@ -74,8 +48,9 @@ adb pull /sdcard/Download/stepspoof_joyrun.log
 
 ## 更新
 
+- **v1.3.1** 修复多进程步频不统一
 - **v1.3.0** 新增陀螺仪/旋转矢量注入与步数基线锚定，多进程步数统一汇总
-- **v1.2.0** 新增运行日志落盘（默认下载目录）；WebUI 加日志卡片
+- **v1.2.0** 运行日志落盘到下载目录
 - **v1.1.8** 整理代码
 - **v1.1.7** 波形替换；新增步长与配速
 - **v1.1.5** 多槽位 hook；修复 WebUI 混合内容拦截

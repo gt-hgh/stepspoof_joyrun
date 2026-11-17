@@ -1,4 +1,4 @@
-// stepspoof_joyrun v1.3.0 — 纯 native Zygisk 模块
+// stepspoof_joyrun v1.3.1 — 纯 native Zygisk 模块
 // 目标：com.huachenjie.shandong_school（闪动校园）
 // 功能：
 //   1) 加速度波形仿真（FuckRun 设计：X=0, Y=1.5·cos, Z=9.81+3.5·sin）
@@ -227,6 +227,8 @@ static std::atomic<long long> g_sim_steps{0};
 static std::atomic<long long> g_local_steps{0};
 static std::atomic<long long> g_sim_other{0};
 static std::atomic<int> g_sim_peers{0};
+// 主进程才有资格写状态文件、决定共享步频、累加全局步数
+static bool g_is_main_proc = false;
 // 当前瞬时目标步频（步/分钟），由 sim_loop 刷新，供加速度波形合成使用
 static std::atomic<int> g_cur_rate{0};
 // 事件类型直方图（诊断：看清 App 到底收哪些传感器）
@@ -235,6 +237,12 @@ static constexpr int kTypeSlots = 64;
 static std::atomic<long long> g_type_cnt[kTypeSlots];
 // 每个类型在本进程内是否已报过首次出现
 static std::atomic<bool> g_type_seen[kTypeSlots];
+
+static int64_t mono_ms() {
+    struct timespec ts {};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
 
 static const char *sensor_type_name(int t) {
     switch (t) {
@@ -796,6 +804,14 @@ static void sim_write_shard(long long steps, int rate);
 static long long sim_read_peers();
 static void sim_prune_shards();
 
+// 共享步频：由主进程决定一次，所有进程照抄。
+// 之前每个进程在自己 tick 里随机锁一个步频，四个进程锁出 107/105/100/118，
+// 而 App 实际吃到的波形频率取决于哪个进程真正在 patch 加速度；控制台设的区间
+// 和 App 显示的步频因此永远对不上。现在只有 main=1 的进程随机，子进程读它写下的值。
+static const char *CTL_CADENCE = "/data/data/" TARGET_PKG_STR "/files/stepspoof_sim/cadence";
+static void sim_write_cadence(int rate, int lo, int hi);
+static bool sim_read_cadence(int *rate, int *lo, int *hi);
+
 // ---------------------------------------------------------------------------
 // 步频仿真线程
 // 每 500ms tick：在 [min, max] 范围内随机取一个步频（步/分钟），
@@ -813,6 +829,8 @@ static void sim_loop() {
     int picked = 0, picked_lo = -1, picked_hi = -1;
     long long ticks = 0;
     long long prune_tick = 0;
+    long long hb_last_steps = 0;
+    int64_t hb_last_ms = 0;
 
     for (;;) {
         usleep((useconds_t)(TICK_MS * 1000));
@@ -844,6 +862,7 @@ static void sim_loop() {
                          g_last_out.load(std::memory_order_relaxed));
                 }
                 g_cur_rate.store(0, std::memory_order_relaxed);
+                if (g_is_main_proc) unlink(CTL_CADENCE);
                 LOGI("sim loop idle: sim_steps total=%lld",
                      g_sim_steps.load(std::memory_order_relaxed));
             }
@@ -862,32 +881,66 @@ static void sim_loop() {
         // 步频稳定性（原设计关键）：只在「开始仿真」或「区间被改动」时取一次
         // 随机值并锁定。每 500ms 重随机会让步态周期抖动，自研计步器直接判成
         // 非人步态；真实跑步的步频在整段里也是近似恒定的。
+        // 随机只由主进程做：多进程时子进程读主进程写下的值，否则各锁各的，
+        // App 吃到的波形频率和界面上设的对不上。
         if (!prev_active || lo != picked_lo || hi != picked_hi) {
-            picked = lo;
-            if (hi > lo) picked = lo + (int)(random() % (hi - lo + 1));
             picked_lo = lo;
             picked_hi = hi;
             prev_active = true;
-            g_cur_rate.store(picked, std::memory_order_relaxed);
-            LOGI("sim cadence locked: %d spm (range %d-%d)", picked, lo, hi);
+            if (g_is_main_proc) {
+                picked = lo;
+                if (hi > lo) picked = lo + (int)(random() % (hi - lo + 1));
+                sim_write_cadence(picked, lo, hi);
+                g_cur_rate.store(picked, std::memory_order_relaxed);
+                LOGI("sim cadence locked: %d spm (range %d-%d) [main]", picked, lo, hi);
+            } else {
+                int r = 0, rlo = -1, rhi = -1;
+                if (sim_read_cadence(&r, &rlo, &rhi) && rlo == lo && rhi == hi
+                    && r >= lo && r <= hi) {
+                    picked = r;
+                    g_cur_rate.store(picked, std::memory_order_relaxed);
+                    LOGI("sim cadence followed: %d spm (range %d-%d) [child]", picked, lo, hi);
+                } else {
+                    // 主进程还没来得及写：先按下限跑，下一 tick 就同步过去了
+                    picked = lo;
+                    g_cur_rate.store(picked, std::memory_order_relaxed);
+                    LOGW("sim cadence pending, fallback %d spm (range %d-%d) [child]",
+                         picked, lo, hi);
+                }
+            }
         } else {
+            if (!g_is_main_proc) {
+                // 子进程每 tick 跟一次：主进程重锁后立刻同步，不用等区间变化
+                int r = 0, rlo = -1, rhi = -1;
+                if (sim_read_cadence(&r, &rlo, &rhi) && rlo == lo && rhi == hi
+                    && r >= lo && r <= hi && r != picked) {
+                    picked = r;
+                    LOGI("sim cadence resync: %d spm (range %d-%d) [child]", picked, lo, hi);
+                }
+            }
             g_cur_rate.store(picked, std::memory_order_relaxed);
         }
 
         // 每 tick 应增加的步数 = picked * TICK_MS / 60000
-        double steps_this_tick = (double)picked * (double)TICK_MS / 60000.0;
-        sim_accum += steps_this_tick;
+        // 只有主进程真正累加：四个进程都跑 sim_loop，如果各自累加再互相求和，
+        // 全局步数就是真实值的 N 倍（日志里 procs=3 时 local=67、peers=135、
+        // total=202 就是三个进程各自累加的产物）。App 读到的步频因此被放大
+        // 到设定值的 N 倍，和界面上设的对不上。子进程只读不写。
+        if (g_is_main_proc) {
+            double steps_this_tick = (double)picked * (double)TICK_MS / 60000.0;
+            sim_accum += steps_this_tick;
 
-        long long add = (long long)floor(sim_accum);
-        if (add > 0) {
-            sim_accum -= (double)add;
-            g_local_steps.fetch_add(add, std::memory_order_relaxed);
+            long long add = (long long)floor(sim_accum);
+            if (add > 0) {
+                sim_accum -= (double)add;
+                g_local_steps.fetch_add(add, std::memory_order_relaxed);
+            }
         }
-
         // 每 tick 落一次分片，并汇总其它进程的仿真步数。
         // 汇总放在 tick 内做（而不是只在心跳里做）是为了让步数曲线跟得上：
         // 心跳 10 秒一次，中间 10 秒的跨进程差异足够被一致性校验抓到。
-        sim_write_shard(g_local_steps.load(std::memory_order_relaxed), picked);
+        // 子进程写 0：它的分片只为让 procs 计数反映真实进程数，不参与累加。
+        sim_write_shard(g_is_main_proc ? g_local_steps.load(std::memory_order_relaxed) : 0, picked);
         long long other = sim_read_peers();
         g_sim_other.store(other, std::memory_order_relaxed);
         g_sim_steps.store(g_local_steps.load(std::memory_order_relaxed) + other,
@@ -898,19 +951,31 @@ static void sim_loop() {
         // 之前没有周期日志，设备 C 那 12 分钟的空白没法判断是「没在跑」还是
         // 「在跑但没读传感器」，现在这一行直接给出答案。
         if (++ticks % 20 == 0) {
-            LOGI("heartbeat: rate=%d local=%lld peers=%lld total=%lld "
+            // meas = 本进程这一窗口内实测出的步频。accel 改动量和步数是两套独立
+            // 计时（一个是采样事件数、一个是仿真线程累加），光看两个数放一起会
+            // 以为「改了 8 万个事件只走 166 步」是异常，meas 直接给出真实节拍。
+            int64_t now = mono_ms();
+            long long cur = g_local_steps.load(std::memory_order_relaxed);
+            int meas = 0;
+            if (hb_last_ms > 0) {
+                double span = (double)(now - hb_last_ms) / 1000.0;
+                if (span > 0.5) meas = (int)((double)(cur - hb_last_steps) * 60.0 / span + 0.5);
+            }
+            hb_last_ms = now;
+            hb_last_steps = cur;
+            LOGI("heartbeat: rate=%d meas=%d this_steps=%lld all_steps=%lld procs=%d "
                  "hits=%lld patched=%lld "
                  "accel=%lld/lp=%lld gyro=%lld/gp=%lld rv=%lld/rp=%lld "
-                 "stepdet=%lld stepcnt=%lld/cp=%lld procs=%d anchored=%d "
+                 "stepdet=%lld stepcnt=%lld/cp=%lld anchored=%d "
                  "base_hw=%lld last_out=%lld",
-                 picked, g_local_steps.load(), g_sim_other.load(),
-                 g_sim_steps.load(), g_hook_hits.load(), g_patched_events.load(),
+                 picked, meas, cur, g_sim_steps.load(std::memory_order_relaxed),
+                 g_sim_peers.load(),
+                 g_hook_hits.load(), g_patched_events.load(),
                  g_type_cnt[ASENSOR_TYPE_ACCELEROMETER].load(), g_accel_patched.load(),
                  g_type_cnt[ASENSOR_TYPE_GYROSCOPE].load(), g_gyro_patched.load(),
                  g_type_cnt[ASENSOR_TYPE_ROTATION_VECTOR].load(), g_rv_patched.load(),
                  g_type_cnt[ASENSOR_TYPE_STEP_DETECTOR].load(),
                  g_type_cnt[ASENSOR_TYPE_STEP_COUNTER].load(), g_cnt_patched.load(),
-                 g_sim_peers.load(),
                  g_base_valid.load() ? 1 : 0,
                  g_hw_at_anchor.load(), g_last_out.load());
         }
@@ -926,19 +991,60 @@ static void sim_loop() {
 static const char *CTL_CONF  = "/data/data/" TARGET_PKG_STR "/files/stepspoof.conf";
 static const char *CTL_STATE = "/data/data/" TARGET_PKG_STR "/files/stepspoof.state";
 
-// 把自己的分片写出去。文件名用 pid 区分，内容只有步数和步频两个数。
+static int64_t mono_ms();
+
+// 读进程启动时刻（/proc/<pid>/stat 第 22 字段，单位 jiffies）。
+// 光看 /proc/<pid> 是否存在不够：pid 会被回收复用，上一个被杀的进程留下的分片
+// 会被当成「还活着的兄弟进程」读进去（日志里 procs 从 7 掉到 3、peers 从 1492
+// 掉到 135 就是这么来的）。带上 starttime 才能判定分片是不是同一个进程写的。
+static unsigned long long proc_starttime(int pid) {
+    char p[64];
+    snprintf(p, sizeof(p), "/proc/%d/stat", pid);
+    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    char b[512] = {};
+    ssize_t r = read(fd, b, sizeof(b) - 1);
+    close(fd);
+    if (r <= 0) return 0;
+    // comm 字段可能含空格和括号，从最后一个 ')' 之后开始数
+    char *rp = strrchr(b, ')');
+    if (rp == nullptr) return 0;
+    char *s = rp + 1;
+    // ')' 之后是第 3 字段（state），starttime 是第 22 字段，再往后跳过 19 个
+    for (int f = 3; f < 22; ++f) {
+        while (*s == ' ') ++s;
+        while (*s && *s != ' ') ++s;
+    }
+    while (*s == ' ') ++s;
+    return strtoull(s, nullptr, 10);
+}
+
+// 分片是否还由活着的同一进程持有
+static bool shard_alive(int pid, unsigned long long starttime) {
+    if (pid <= 0) return false;
+    char proc[64];
+    snprintf(proc, sizeof(proc), "/proc/%d", pid);
+    if (access(proc, F_OK) != 0) return false;
+    if (starttime == 0) return true;      // 读不到 starttime 时退化成只管存在性
+    unsigned long long cur = proc_starttime(pid);
+    if (cur == 0) return true;            // 同上
+    return cur == starttime;
+}
+
+// 把自己的分片写出去。文件名用 pid 区分，内容是「步数 步频 启动时刻」。
 static void sim_write_shard(long long steps, int rate) {
     char path[256];
     snprintf(path, sizeof(path), "%s/%d", CTL_SIMDIR, getpid());
     int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
     if (fd < 0) return;
-    char b[64];
-    int n = snprintf(b, sizeof(b), "%lld %d\n", steps, rate);
+    char b[96];
+    int n = snprintf(b, sizeof(b), "%lld %d %llu\n", steps, rate, proc_starttime(getpid()));
     (void)!write(fd, b, (size_t)n);
     close(fd);
 }
 
-// 汇总所有分片。返回别的进程的步数之和，并统计分片数。
+// 汇总所有分片。返回别的进程的步数之和，并统计活着的分片数。
+// 死进程的分片在这一步就删掉，不再等 40 tick 的定期清理。
 static long long sim_read_peers() {
     DIR *d = opendir(CTL_SIMDIR);
     if (d == nullptr) {
@@ -954,23 +1060,31 @@ static long long sim_read_peers() {
         if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
         int pid = atoi(de->d_name);
         if (pid <= 0) continue;
-        ++peers;
-        if (pid == self) continue;
         char path[256];
         snprintf(path, sizeof(path), "%s/%s", CTL_SIMDIR, de->d_name);
         int fd = open(path, O_RDONLY | O_CLOEXEC);
         if (fd < 0) continue;
-        char b[64] = {};
+        char b[96] = {};
         ssize_t r = read(fd, b, sizeof(b) - 1);
         close(fd);
-        if (r > 0) sum += atoll(b);
+        long long steps = 0, rate = 0;
+        unsigned long long st = 0;
+        int got = (r > 0) ? sscanf(b, "%lld %lld %llu", &steps, &rate, &st) : 0;
+        if (got < 2) { unlink(path); continue; }
+        if (pid != self && !shard_alive(pid, st)) {
+            unlink(path);
+            continue;
+        }
+        ++peers;
+        if (pid == self) continue;
+        if (steps > 0) sum += steps;
     }
     closedir(d);
     g_sim_peers.store(peers, std::memory_order_relaxed);
     return sum;
 }
 
-// 清理已经不存在的进程留下的分片（进程被杀时来不及删）
+// 清理已经不存在的进程留下的分片（兜底：sim_read_peers 已经顺手删过了）
 static void sim_prune_shards() {
     DIR *d = opendir(CTL_SIMDIR);
     if (d == nullptr) return;
@@ -980,15 +1094,40 @@ static void sim_prune_shards() {
         if (de->d_name[0] < '0' || de->d_name[0] > '9') continue;
         int pid = atoi(de->d_name);
         if (pid <= 0 || pid == self) continue;
-        char proc[64];
-        snprintf(proc, sizeof(proc), "/proc/%d", pid);
-        if (access(proc, F_OK) != 0) {
+        if (!shard_alive(pid, 0)) {
             char path[256];
             snprintf(path, sizeof(path), "%s/%s", CTL_SIMDIR, de->d_name);
             unlink(path);
         }
     }
     closedir(d);
+}
+
+// 主进程写共享步频，格式「步频 下限 上限」。
+static void sim_write_cadence(int rate, int lo, int hi) {
+    if (mkdir(CTL_SIMDIR, 0777) != 0 && errno != EEXIST) return;
+    int fd = open(CTL_CADENCE, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+    if (fd < 0) return;
+    char b[64];
+    int n = snprintf(b, sizeof(b), "%d %d %d\n", rate, lo, hi);
+    (void)!write(fd, b, (size_t)n);
+    close(fd);
+}
+
+// 子进程读共享步频。区间对不上说明这不是本次录音写下的值，按无效处理。
+static bool sim_read_cadence(int *rate, int *lo, int *hi) {
+    int fd = open(CTL_CADENCE, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    char b[64] = {};
+    ssize_t r = read(fd, b, sizeof(b) - 1);
+    close(fd);
+    if (r <= 0) return false;
+    int a = 0, c = 0, d = 0;
+    if (sscanf(b, "%d %d %d", &a, &c, &d) != 3) return false;
+    if (rate) *rate = a;
+    if (lo) *lo = c;
+    if (hi) *hi = d;
+    return true;
 }
 
 static void apply_conf_text(char *buf) {
@@ -1045,8 +1184,7 @@ static void write_state_file() {
     close(fd);
 }
 
-// 主进程才有资格写状态文件，避免子进程互相覆盖
-static bool g_is_main_proc = false;
+// 主进程才有资格写状态文件，避免子进程互相覆盖（g_is_main_proc 定义在全局区）
 
 static void conf_watch_loop() {
     LOGI("conf_watch started: %s", CTL_CONF);
@@ -1197,8 +1335,8 @@ static void handle_client(int fd) {
         g_cfg.sim_rate_max.store((int)json_num(body, "sim_rate_max", g_cfg.sim_rate_max.load()));
         g_cfg.sim_accel.store(json_num(body, "sim_accel", g_cfg.sim_accel.load() ? 1 : 0) != 0);
         g_cfg.stride_cm.store((int)json_num(body, "stride", g_cfg.stride_cm.load()));
-        LOGI("cfg updated: en=%d off=%lld abs=%d val=%lld sim=%d min=%d max=%d "
-             "acc=%d stride=%dcm pace=%d cm/s",
+        LOGI("cfg updated: enabled=%d offset=%lld absolute=%d abs_value=%lld "
+             "sim_active=%d min=%d max=%d sim_accel=%d stride=%dcm pace=%d cm/s",
              g_cfg.enabled.load() ? 1 : 0, g_cfg.step_offset.load(),
              g_cfg.absolute_mode.load() ? 1 : 0, g_cfg.absolute_value.load(),
              g_cfg.sim_active.load() ? 1 : 0, g_cfg.sim_rate_min.load(),
@@ -1348,7 +1486,7 @@ public:
         }
 
         // 首个日志落盘，附带一次环境快照，便于他人排障
-        LOGI("===== stepspoof_joyrun v1.3.0 start pid=%d main=%d =====",
+        LOGI("===== stepspoof_joyrun v1.3.1 start pid=%d main=%d =====",
              getpid(), is_main ? 1 : 0);
         LOGI("log file: %s", g_log_path[0] ? g_log_path : "(not opened yet)");
 

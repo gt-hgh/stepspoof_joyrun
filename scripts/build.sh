@@ -8,7 +8,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$ROOT/build"
 DIST="$ROOT/dist"
 MODID="stepspoof_joyrun"
-VER="v1.3.0"
+VER="v1.3.1"
 
 echo "[*] NDK   = $NDK"
 echo "[*] ROOT  = $ROOT"
