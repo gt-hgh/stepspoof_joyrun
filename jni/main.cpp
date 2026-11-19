@@ -1,4 +1,4 @@
-// stepspoof_joyrun v1.3.4 — 纯 native Zygisk 模块
+// stepspoof_joyrun v1.3.5 — 纯 native Zygisk 模块
 // 目标：com.huachenjie.shandong_school（闪动校园）
 // 功能：
 //   1) 加速度波形仿真（FuckRun 设计：X=0, Y=1.5·cos, Z=9.81+3.5·sin）
@@ -17,7 +17,8 @@
 //      （2MB 自动轮转到 .old；/sdcard 不可写时降级到 App 私有目录）
 //      每行带 pid；每 10 秒一行 heartbeat 快照；每种传感器类型首次出现报一次。
 //      v1.3.4 起启动横幅带日期与设备名称/指纹，多台设备的日志可区分。
-//   6) 本地 HTTP API（127.0.0.1:8888）供 KSU WebUI 通过 root shell nc 访问
+//      v1.3.5 起新增传感器冲突监测（仅限目标包内：Hook 占坑/覆写/PLT 指向/原始数据异常）。
+//   6) 本地 HTTP API（127.0.0.1:8888..8897）供 KSU WebUI 通过 root shell nc 访问
 //   7) conf_watch_loop：轮询 App 私有目录 stepspoof.conf，断连后持久化生效
 // 不依赖 LSPosed / 不建 ClassLoader / 不加载内存 dex。
 //
@@ -40,6 +41,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <mutex>
 #include <set>
 #include <string>
 #include <thread>
@@ -63,6 +65,45 @@
 
 // 目标包名（日志降级路径、控制通道路径都依赖它，必须在最前定义）
 #define TARGET_PKG_STR "com.huachenjie.shandong_school"
+
+// 多用户/双开路径解析：
+//   user 0  → /data/data/<pkg>/files
+//   user >0 → 优先 /data/user/<userId>/<pkg>/files（解决部分 ROM 上双开进程
+//             访问 /data/data/<pkg>/files 时落到 user 0 目录导致 EACCES 的问题）
+static const char *app_files_dir() {
+    static char dir[256] = {};
+    static std::atomic<int> cached_uid{-1};
+    int cur_uid = (int)getuid();
+    if (cur_uid >= 10000 && cached_uid.load(std::memory_order_acquire) == cur_uid && dir[0]) {
+        return dir;
+    }
+    int user_id = cur_uid / 100000;
+    char cand[256];
+    if (user_id > 0) {
+        snprintf(cand, sizeof(cand), "/data/user/%d/%s/files", user_id, TARGET_PKG_STR);
+        if (access(cand, F_OK) == 0) {
+            snprintf(dir, sizeof(dir), "%s", cand);
+            if (cur_uid >= 10000) cached_uid.store(cur_uid, std::memory_order_release);
+            return dir;
+        }
+        char pkg_dir[256];
+        snprintf(pkg_dir, sizeof(pkg_dir), "/data/user/%d/%s", user_id, TARGET_PKG_STR);
+        if (access(pkg_dir, F_OK) == 0 && mkdir(cand, 0700) == 0) {
+            snprintf(dir, sizeof(dir), "%s", cand);
+            if (cur_uid >= 10000) cached_uid.store(cur_uid, std::memory_order_release);
+            return dir;
+        }
+    }
+    snprintf(cand, sizeof(cand), "/data/data/%s/files", TARGET_PKG_STR);
+    if (access(cand, F_OK) != 0 && cur_uid >= 10000) {
+        char pkg_dir[256];
+        snprintf(pkg_dir, sizeof(pkg_dir), "/data/data/%s", TARGET_PKG_STR);
+        if (access(pkg_dir, F_OK) == 0) mkdir(cand, 0700);
+    }
+    snprintf(dir, sizeof(dir), "%s", cand);
+    if (cur_uid >= 10000) cached_uid.store(cur_uid, std::memory_order_release);
+    return dir;
+}
 
 // ---------------------------------------------------------------------------
 // 设备标识（v1.3.4）
@@ -165,8 +206,7 @@ static void log_open() {
 
     // 兜底：App 私有目录（root 与 App 自身都可读，用户可用文件管理器 root 模式取）
     char fallback[256];
-    snprintf(fallback, sizeof(fallback),
-             "/data/data/%s/files/stepspoof.log", TARGET_PKG_STR);
+    snprintf(fallback, sizeof(fallback), "%s/stepspoof.log", app_files_dir());
     int fd = open(fallback, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0666);
     if (fd >= 0) {
         g_log_fd = fd;
@@ -438,6 +478,168 @@ static std::atomic<bool>   g_cnt_seen_simoff{false};
 static thread_local int g_depth = 0;
 
 // ---------------------------------------------------------------------------
+// 传感器冲突与外部修改监测（v1.3.5）
+// 严格限定在 TARGET_PKG_STR 进程内部：只看传感器 Hook 入口是否被占用/覆写、
+// PLT 指向是否异常、以及读取到的原始传感器事件是否出现冻结/时间戳倒退。
+// 不扫描其它应用，不读取用户隐私。
+// ---------------------------------------------------------------------------
+static constexpr size_t kMaxConflictEntries = 30;
+static std::mutex g_conflict_mtx;
+static std::vector<std::string> g_conflicts;
+static std::atomic<int> g_conflict_total{0};
+
+static void record_conflict(const char *tag, const char *detail) {
+    struct timespec ts {};
+    clock_gettime(CLOCK_REALTIME, &ts);
+    struct tm tmv {};
+    time_t sec = ts.tv_sec;
+    localtime_r(&sec, &tmv);
+    char entry[384];
+    snprintf(entry, sizeof(entry), "%02d:%02d:%02d [%s] %s",
+             tmv.tm_hour, tmv.tm_min, tmv.tm_sec, tag, detail);
+    {
+        std::lock_guard<std::mutex> lk(g_conflict_mtx);
+        if (g_conflicts.size() >= kMaxConflictEntries) {
+            g_conflicts.erase(g_conflicts.begin());
+        }
+        g_conflicts.emplace_back(entry);
+    }
+    g_conflict_total.fetch_add(1, std::memory_order_relaxed);
+    LOGW("sensor conflict [%s]: %s", tag, detail);
+}
+
+static void resolve_addr_owner(uintptr_t addr, char *out, size_t n) {
+    if (!out || n == 0) return;
+    if (addr == 0) { snprintf(out, n, "unknown"); return; }
+    Dl_info info {};
+    if (dladdr((const void *)addr, &info) && info.dli_fname && info.dli_fname[0]) {
+        const char *slash = strrchr(info.dli_fname, '/');
+        const char *lib = slash ? slash + 1 : info.dli_fname;
+        if (info.dli_sname && info.dli_sname[0]) {
+            snprintf(out, n, "%s(%s)", lib, info.dli_sname);
+        } else {
+            snprintf(out, n, "%s+0x%lx", lib,
+                     (unsigned long)(addr - (uintptr_t)info.dli_fbase));
+        }
+    } else {
+        snprintf(out, n, "0x%llx(anonymous/hidden)", (unsigned long long)addr);
+    }
+}
+
+static bool detect_aarch64_hook(const uint32_t *insns, uintptr_t base,
+                                char *owner_out, size_t owner_n) {
+    if (!insns) return false;
+    uint32_t i0 = insns[0];
+    // 1) LDR X16/X17, #imm (0x58000010 / 0x58000011) + BR X16/X17
+    if ((i0 & 0xFF00001Eu) == 0x58000010u) {
+        uint32_t reg = i0 & 0x1Fu;
+        int32_t imm19 = (int32_t)((i0 >> 5) & 0x7FFFFu);
+        if (imm19 & 0x40000) imm19 |= ~0x7FFFF;
+        uintptr_t lit = base + (intptr_t)imm19 * 4;
+        uint32_t br_expect = (reg == 16) ? 0xD61F0200u : 0xD61F0220u;
+        if (insns[1] == br_expect) {
+            uintptr_t target = 0;
+            if (lit >= base && (lit - base) <= 64) {
+                memcpy(&target, (const void *)lit, sizeof(target));
+            }
+            resolve_addr_owner(target, owner_out, owner_n);
+            return true;
+        }
+    }
+    // 2) 无条件跳转 B imm26 (0x14000000)
+    if ((i0 & 0xFC000000u) == 0x14000000u) {
+        int32_t imm26 = (int32_t)(i0 & 0x03FFFFFFu);
+        if (imm26 & 0x02000000) imm26 |= ~0x03FFFFFF;
+        uintptr_t target = base + (intptr_t)imm26 * 4;
+        resolve_addr_owner(target, owner_out, owner_n);
+        return true;
+    }
+    // 3) ADRP + ... + BR Xn
+    if ((i0 & 0x9F000000u) == 0x90000000u) {
+        for (int k = 1; k < 4; ++k) {
+            if ((insns[k] & 0xFFFFFC1Fu) == 0xD61F0000u) {
+                snprintf(owner_out, owner_n, "ADRP+BR_trampoline");
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+struct RawSensorTrack {
+    int64_t last_ts = 0;
+    float last_x = 0.0f, last_y = 0.0f, last_z = 0.0f;
+    int same_xyz = 0;
+    int64_t last_ts_warn_ms = 0;
+    int64_t last_frz_warn_ms = 0;
+};
+static std::mutex g_raw_chk_mtx;
+static RawSensorTrack g_raw_track[4]; // 0=ACCEL, 1=GYRO, 2=RV, 3=STEP_COUNTER
+
+// 在我们 patch 之前检查原始事件是否已被上游/其它修改者篡改或冻结（严格节流）
+static void check_raw_sensor_anomaly(const ASensorEvent *ev) {
+    int cat = -1;
+    if (is_accel_type(ev->type)) cat = 0;
+    else if (ev->type == ASENSOR_TYPE_GYROSCOPE || ev->type == ASENSOR_TYPE_GYROSCOPE_UNCALIBRATED) cat = 1;
+    else if (ev->type == ASENSOR_TYPE_ROTATION_VECTOR || ev->type == ASENSOR_TYPE_GAME_ROTATION_VECTOR) cat = 2;
+    else if (ev->type == ASENSOR_TYPE_STEP_COUNTER) cat = 3;
+    if (cat < 0) return;
+
+    int64_t now_ms = mono_ms();
+    bool warn_ts = false;
+    bool warn_frz = false;
+    int64_t prev_ts = 0;
+    float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+    int same_cnt = 0;
+
+    {
+        std::lock_guard<std::mutex> lk(g_raw_chk_mtx);
+        RawSensorTrack &tr = g_raw_track[cat];
+        if (ev->timestamp <= 0 || (tr.last_ts > 0 && ev->timestamp < tr.last_ts)) {
+            if (now_ms - tr.last_ts_warn_ms >= 15000) {
+                tr.last_ts_warn_ms = now_ms;
+                prev_ts = tr.last_ts;
+                warn_ts = true;
+            }
+        }
+        tr.last_ts = ev->timestamp;
+
+        if (cat == 0 || cat == 1) {
+            if (ev->data[0] == tr.last_x && ev->data[1] == tr.last_y && ev->data[2] == tr.last_z) {
+                ++tr.same_xyz;
+                if (tr.same_xyz >= 30 && (now_ms - tr.last_frz_warn_ms >= 30000)) {
+                    tr.last_frz_warn_ms = now_ms;
+                    fx = ev->data[0]; fy = ev->data[1]; fz = ev->data[2];
+                    same_cnt = tr.same_xyz;
+                    warn_frz = true;
+                }
+            } else {
+                tr.last_x = ev->data[0];
+                tr.last_y = ev->data[1];
+                tr.last_z = ev->data[2];
+                tr.same_xyz = 1;
+            }
+        }
+    }
+
+    if (warn_ts) {
+        char msg[192];
+        snprintf(msg, sizeof(msg), "type=%d(%s) ts=%lld prev=%lld proc=%s",
+                 ev->type, sensor_type_name(ev->type),
+                 (long long)ev->timestamp, (long long)prev_ts, proc_name());
+        record_conflict("raw-ts", msg);
+    }
+    if (warn_frz) {
+        char msg[192];
+        snprintf(msg, sizeof(msg),
+                 "type=%d(%s) frozen=(%.3f,%.3f,%.3f) x%d proc=%s",
+                 ev->type, sensor_type_name(ev->type),
+                 fx, fy, fz, same_cnt, proc_name());
+        record_conflict("raw-frozen", msg);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 传感器事件处理
 // ---------------------------------------------------------------------------
 static inline void patch_event(ASensorEvent *ev) {
@@ -652,6 +854,7 @@ static int hook_get_events(ASensorEventQueue *queue, ASensorEvent *events, size_
         bool en = g_cfg.enabled.load(std::memory_order_relaxed);
         for (int i = 0; i < n; ++i) {
             bump_type(events[i].type);
+            check_raw_sensor_anomaly(&events[i]);
             if (en) patch_event(&events[i]);
         }
     }
@@ -670,6 +873,35 @@ static constexpr int kMaxHooks = 4;
 static sensor_read_fn g_origs[kMaxHooks] = {nullptr};
 static std::atomic<int> g_hook_cnt{0};
 
+struct HookSlotInfo {
+    void *fn = nullptr;
+    uint8_t stub[16] = {};
+    char sym[96] = {};
+    bool overwritten = false;
+};
+static HookSlotInfo g_hook_slots[kMaxHooks];
+
+static void check_hook_integrity() {
+    int cnt = g_hook_cnt.load(std::memory_order_relaxed);
+    for (int i = 0; i < cnt && i < kMaxHooks; ++i) {
+        HookSlotInfo &s = g_hook_slots[i];
+        if (!s.fn || s.overwritten) continue;
+        if (memcmp(s.fn, s.stub, sizeof(s.stub)) != 0) {
+            s.overwritten = true;
+            char owner[128] = "unknown";
+            uint32_t cur[4] = {};
+            memcpy(cur, s.fn, sizeof(cur));
+            if (!detect_aarch64_hook(cur, (uintptr_t)s.fn, owner, sizeof(owner))) {
+                snprintf(owner, sizeof(owner), "insn0=0x%08x", cur[0]);
+            }
+            char msg[256];
+            snprintf(msg, sizeof(msg), "slot=%d sym=%s overwritten by %s",
+                     i, s.sym[0] ? s.sym : "?", owner);
+            record_conflict("hook-overwritten", msg);
+        }
+    }
+}
+
 template <int I>
 static ssize_t hook_slot(void *a, ASensorEvent *events, size_t count) {
     if (g_origs[I] == nullptr) return 0;
@@ -685,6 +917,7 @@ static ssize_t hook_slot(void *a, ASensorEvent *events, size_t count) {
         bool en = g_cfg.enabled.load(std::memory_order_relaxed);
         for (ssize_t i = 0; i < n; ++i) {
             bump_type(events[i].type);
+            check_raw_sensor_anomaly(&events[i]);
             if (en) patch_event(&events[i]);
         }
     }
@@ -702,9 +935,23 @@ static void *kHookFns[kMaxHooks] = {
 // 跳转桩 16 字节：LDR X16, #8；BR X16；<8 字节绝对地址>
 // 蹦床布局：[0..15] 原始头 16 字节 + [16..31] 跳回 fn+16
 // ---------------------------------------------------------------------------
-static bool inline_hook_abs(void *target_fn, void *hook_fn, void **orig_out) {
+static bool inline_hook_abs(void *target_fn, void *hook_fn, void **orig_out,
+                            int slot_idx, const char *sym_name) {
     uintptr_t fn = (uintptr_t)target_fn;
     constexpr size_t STUB = 16;
+
+    // 占坑检测：如果入口前 16 字节已经不是常规函数序言而是跳转桩，说明之前已被别的模块/框架 Hook
+    {
+        uint32_t orig_insns[4] = {};
+        memcpy(orig_insns, (const void *)fn, sizeof(orig_insns));
+        char owner[128] = {};
+        if (detect_aarch64_hook(orig_insns, fn, owner, sizeof(owner))) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "sym=%s already hooked before us (target=%s)",
+                     sym_name ? sym_name : "?", owner);
+            record_conflict("hook-pre", msg);
+        }
+    }
 
     // 分配 RWX 蹦床
     uint8_t *tramp = (uint8_t *)mmap(nullptr, STUB * 2,
@@ -776,6 +1023,13 @@ static bool inline_hook_abs(void *target_fn, void *hook_fn, void **orig_out) {
     }
 
     *orig_out = tramp;
+    if (slot_idx >= 0 && slot_idx < kMaxHooks) {
+        g_hook_slots[slot_idx].fn = target_fn;
+        memcpy(g_hook_slots[slot_idx].stub, patch, STUB);
+        snprintf(g_hook_slots[slot_idx].sym, sizeof(g_hook_slots[slot_idx].sym),
+                 "%s", sym_name ? sym_name : "");
+        g_hook_slots[slot_idx].overwritten = false;
+    }
     LOGI("inline_hook OK fn=%p hook=%p tramp=%p", (void *)fn, hook_fn, tramp);
     return true;
 }
@@ -816,7 +1070,7 @@ static bool try_install_sensor_hook() {
         if (dup) continue;
 
         LOGI("sensor sym: %s @ %p (lib=%s)", c.sym, fn, c.lib ? c.lib : "default");
-        if (inline_hook_abs(fn, kHookFns[slot], (void **)&g_origs[slot])) {
+        if (inline_hook_abs(fn, kHookFns[slot], (void **)&g_origs[slot], slot, c.sym)) {
             LOGI("sensor inline hook[%d] installed via %s", slot, c.sym);
             hooked[hooked_n++] = fn;
             ++slot;
@@ -908,7 +1162,7 @@ static void load_config_from_dir(int dir_fd) {
 // 做法：每个进程按 pid 写自己的分片，读取时把所有分片求和，得到全局唯一的
 // 仿真步数序列——这样任何进程算出来的计步器曲线都完全一致。
 // ---------------------------------------------------------------------------
-static const char *CTL_SIMDIR = "/data/data/" TARGET_PKG_STR "/files/stepspoof_sim";
+static char CTL_SIMDIR[256] = "/data/data/" TARGET_PKG_STR "/files/stepspoof_sim";
 static void sim_write_shard(long long steps, int rate);
 static long long sim_read_peers();
 static void sim_prune_shards();
@@ -917,7 +1171,7 @@ static void sim_prune_shards();
 // 之前每个进程在自己 tick 里随机锁一个步频，四个进程锁出 107/105/100/118，
 // 而 App 实际吃到的波形频率取决于哪个进程真正在 patch 加速度；控制台设的区间
 // 和 App 显示的步频因此永远对不上。现在只有 main=1 的进程随机，子进程读它写下的值。
-static const char *CTL_CADENCE = "/data/data/" TARGET_PKG_STR "/files/stepspoof_sim/cadence";
+static char CTL_CADENCE[256] = "/data/data/" TARGET_PKG_STR "/files/stepspoof_sim/cadence";
 static void sim_write_cadence(int rate, int lo, int hi);
 static bool sim_read_cadence(int *rate, int *lo, int *hi);
 
@@ -1104,9 +1358,18 @@ static void sim_loop() {
 // WebUI 无法 fetch http://127.0.0.1:8888（https 页面 ←→ http 的混合内容会被
 // WebView 拦截），改由 ksu.exec 以 root 身份写控制文件，本进程轮询读取。
 // 路径选在 App 私有目录：root 可写，App 自身必然可读（避开 /data/adb 的 SELinux 限制）。
+// 双开/分身空间由 init_ctl_paths() 在 postAppSpecialize 后按真实 userId 解析。
 // ---------------------------------------------------------------------------
-static const char *CTL_CONF  = "/data/data/" TARGET_PKG_STR "/files/stepspoof.conf";
-static const char *CTL_STATE = "/data/data/" TARGET_PKG_STR "/files/stepspoof.state";
+static char CTL_CONF[256]  = "/data/data/" TARGET_PKG_STR "/files/stepspoof.conf";
+static char CTL_STATE[256] = "/data/data/" TARGET_PKG_STR "/files/stepspoof.state";
+
+static void init_ctl_paths() {
+    const char *dir = app_files_dir();
+    snprintf(CTL_CONF, sizeof(CTL_CONF), "%s/stepspoof.conf", dir);
+    snprintf(CTL_STATE, sizeof(CTL_STATE), "%s/stepspoof.state", dir);
+    snprintf(CTL_SIMDIR, sizeof(CTL_SIMDIR), "%s/stepspoof_sim", dir);
+    snprintf(CTL_CADENCE, sizeof(CTL_CADENCE), "%s/stepspoof_sim/cadence", dir);
+}
 
 static int64_t mono_ms();
 
@@ -1361,6 +1624,7 @@ static void conf_watch_loop() {
     off_t last_sz = -1;
     time_t last_mt = 0;
     bool first = true;
+    int tick = 0;
 
     for (;;) {
         usleep(700 * 1000);
@@ -1387,6 +1651,7 @@ static void conf_watch_loop() {
             LOGW("conf stat failed: %s", strerror(errno));
         }
 
+        if (++tick % 15 == 0) check_hook_integrity();
         if (g_is_main_proc) write_state_file();
     }
 }
@@ -1463,7 +1728,7 @@ static void handle_client(int fd) {
                  "\"acc\":%lld,\"linacc\":%lld,\"accu\":%lld,"
                  "\"gyro\":%lld,\"rv\":%lld,\"stepdet\":%lld,\"stepcnt\":%lld,"
                  "\"stride\":%d,\"speed_cmps\":%d,\"pkg\":\"%s\","
-                 "\"port\":%d,\"uid\":%d,\"proc\":\"%s\",\"sensors\":%d}",
+                 "\"port\":%d,\"uid\":%d,\"proc\":\"%s\",\"sensors\":%d,\"conflicts\":%d}",
                  g_cfg.enabled.load() ? 1 : 0,
                  g_cfg.step_offset.load(),
                  g_cfg.absolute_mode.load() ? 1 : 0,
@@ -1489,7 +1754,35 @@ static void handle_client(int fd) {
                  (int)((long long)g_cur_rate.load() * g_cfg.stride_cm.load() / 60),
                  TARGET_PKG,
                  g_webui_port.load(), (int)getuid(),
-                 proc_name(), active_sensor_types());
+                 proc_name(), active_sensor_types(), g_conflict_total.load());
+        http_reply(fd, 200, "application/json", js);
+    } else if (method == "GET" && path == "/api/conflict") {
+        std::vector<std::string> snap;
+        {
+            std::lock_guard<std::mutex> lk(g_conflict_mtx);
+            snap = g_conflicts;
+        }
+        std::string js = "{\"pkg\":\"";
+        js += TARGET_PKG;
+        js += "\",\"proc\":\"";
+        js += proc_name();
+        js += "\",\"uid\":";
+        js += std::to_string((int)getuid());
+        js += ",\"hooks\":";
+        js += std::to_string(g_hook_cnt.load());
+        js += ",\"total\":";
+        js += std::to_string(g_conflict_total.load());
+        js += ",\"events\":[";
+        for (size_t i = 0; i < snap.size(); ++i) {
+            if (i > 0) js += ',';
+            js += '"';
+            for (unsigned char ch : snap[i]) {
+                if (ch == '"' || ch == '\\') { js += '\\'; js += (char)ch; }
+                else if (ch >= 0x20) { js += (char)ch; }
+            }
+            js += '"';
+        }
+        js += "]}";
         http_reply(fd, 200, "application/json", js);
     } else if (method == "POST" && path == "/api/config") {
         size_t body_at = req.find("\r\n\r\n");
@@ -1664,6 +1957,18 @@ public:
             if (api->pltHookCommit()) {
                 LOGI("sensor hook committed: %zu sos scanned orig=%p",
                      sos.size(), (void *)g_orig_get_events);
+                if (g_orig_get_events != nullptr) {
+                    Dl_info dl {};
+                    if (dladdr((const void *)g_orig_get_events, &dl) && dl.dli_fname &&
+                        !strstr(dl.dli_fname, "libandroid.so") &&
+                        !strstr(dl.dli_fname, "libandroid_runtime.so") &&
+                        !strstr(dl.dli_fname, "libsensor.so")) {
+                        char msg[256];
+                        snprintf(msg, sizeof(msg), "ASensorEventQueue_getEvents PLT -> %s",
+                                 dl.dli_fname);
+                        record_conflict("plt-hook", msg);
+                    }
+                }
             } else {
                 LOGE("pltHookCommit failed on all %zu sos", sos.size());
             }
@@ -1680,6 +1985,9 @@ public:
             return;
         }
 
+        // 先按目标进程真实 uid 解析私有目录（区分 user 0 与双开空间）
+        init_ctl_paths();
+
         // 首个日志落盘，附带一次环境快照，便于他人排障。
         // 时间戳带日期（行内时间戳只有时分秒，跨天无法定位是哪一天）；
         // 再跟设备名称与指纹，多台设备的日志才不会互相混淆。
@@ -1694,8 +2002,8 @@ public:
                  tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
 
         const DeviceInfo &dev = device_info();
-        LOGI("===== stepspoof_joyrun v1.3.4 start %s pid=%d main=%d =====",
-             when, getpid(), is_main ? 1 : 0);
+        LOGI("===== stepspoof_joyrun v1.3.5 start %s pid=%d main=%d uid=%d =====",
+             when, getpid(), is_main ? 1 : 0, (int)getuid());
         LOGI("device: %s | %s | %s", dev.name, dev.android, dev.abi);
         LOGI("device fingerprint: %s", dev.fp8);
         LOGI("device fingerprint full: %s",
@@ -1706,6 +2014,8 @@ public:
         if (g_hook_cnt.load() == 0) {
             try_install_sensor_hook();
         }
+        LOGI("sensor conflict check: active (hooks=%d proc=%s conflicts=%d)",
+             g_hook_cnt.load(), proc_name(), g_conflict_total.load());
 
         // 仿真、控制通道在所有目标进程都起：真正读传感器的可能是子进程，
         // 只给主进程起会导致子进程 sim_active 恒为 false，波形永远不注入。
