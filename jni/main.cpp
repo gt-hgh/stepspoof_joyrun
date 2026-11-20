@@ -1,4 +1,4 @@
-// stepspoof_joyrun v1.3.5 — 纯 native Zygisk 模块
+// stepspoof_joyrun v1.3.6 — 纯 native Zygisk 模块
 // 目标：com.huachenjie.shandong_school（闪动校园）
 // 功能：
 //   1) 加速度波形仿真（FuckRun 设计：X=0, Y=1.5·cos, Z=9.81+3.5·sin）
@@ -17,7 +17,10 @@
 //      （2MB 自动轮转到 .old；/sdcard 不可写时降级到 App 私有目录）
 //      每行带 pid；每 10 秒一行 heartbeat 快照；每种传感器类型首次出现报一次。
 //      v1.3.4 起启动横幅带日期与设备名称/指纹，多台设备的日志可区分。
-//      v1.3.5 起新增传感器冲突监测（仅限目标包内：Hook 占坑/覆写/PLT 指向/原始数据异常）。
+// v1.3.5 新增传感器冲突监测（仅限目标包内：Hook 占坑/覆写/PLT 指向/原始数据异常）。
+//      v1.3.6 修复：preAppSpecialize 阶段不再做任何 hook（zygote 里做 PLT/inline
+//      改写会导致整机起不来，被救砖模块清空模块目录）；PLT 广播限制到 8 个候选库；
+//      inline hook 前必须确认目标地址在可写映射里。
 //   6) 本地 HTTP API（127.0.0.1:8888..8897）供 KSU WebUI 通过 root shell nc 访问
 //   7) conf_watch_loop：轮询 App 私有目录 stepspoof.conf，断连后持久化生效
 // 不依赖 LSPosed / 不建 ClassLoader / 不加载内存 dex。
@@ -1034,8 +1037,75 @@ static bool inline_hook_abs(void *target_fn, void *hook_fn, void **orig_out,
     return true;
 }
 
-// 安装传感器 hook：同时挂 libsensor.so 的 read + filterEvents（Android 14+ 实际路径），
-// NDK C API 作兜底；同一函数地址只挂一次。
+// ---------------------------------------------------------------------------
+// inline hook 安全闸门（v1.3.5 安全修复）
+//
+// inline_hook_abs 会 mprotect + memcpy 改写目标函数入口。如果目标是
+// 系统只读映射（system_file 标签下的 libandroid.so / libandroid_runtime.so），
+// Android 14+ 的 SELinux 会拒绝，更糟的是部分 ROM 上改写失败却已改了半截，
+// 进程直接崩。所以在动手之前先确认这个地址落在可写的私有映射里：
+//   - /proc/self/maps 里该地址所在行的 perms 必须包含 'w'；
+//   - 或落在 app 私有路径（/data/app/、/data/data/、/data/user/）；
+//   - 或落在匿名可执行映射（inline hook 已装过一次的 trampoline 区）。
+// ---------------------------------------------------------------------------
+static bool is_hook_addr_writable(const void *addr) {
+    if (!addr) return false;
+    uintptr_t target = (uintptr_t)addr;
+
+    // 先看 dladdr：能判出宿主库时按路径白名单快速决策
+    Dl_info info {};
+    if (dladdr(addr, &info) && info.dli_fname && info.dli_fname[0]) {
+        const char *p = info.dli_fname;
+        if (!strstr(p, "/data/app/") && !strstr(p, "/data/data/") &&
+            !strstr(p, "/data/user/") && !strstr(p, "/data/adb/")) {
+            // 系统库：允许，但下面还要用 maps 确认可写
+            LOGI("hook target in system lib %s, verifying mapping perms", p);
+        }
+    }
+
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        LOGW("is_hook_addr_writable: open maps failed (%s), deny hook", strerror(errno));
+        return false;
+    }
+    std::string buf;
+    char tmp[4096];
+    ssize_t r;
+    while ((r = read(fd, tmp, sizeof(tmp))) > 0) buf.append(tmp, (size_t)r);
+    close(fd);
+
+    size_t pos = 0;
+    bool found = false;
+    bool writable = false;
+    while (pos < buf.size()) {
+        size_t eol = buf.find('\n', pos);
+        if (eol == std::string::npos) eol = buf.size();
+        const char *begin = buf.c_str() + pos;
+        const char *end = buf.c_str() + eol;
+        pos = eol + 1;
+
+        unsigned long long lo = 0, hi = 0;
+        char perms[8] = {};
+        if (sscanf(begin, "%llx-%llx %7s", &lo, &hi, perms) != 3) continue;
+        if (target < lo || target >= hi) continue;
+
+        found = true;
+        writable = (perms[1] == 'w');
+        if (!writable) {
+            LOGW("hook target 0x%llx in mapping %llx-%llx perms=%s (not writable)",
+                 (unsigned long long)target, lo, hi, perms);
+        }
+        (void)end;
+        break;
+    }
+
+    if (!found) {
+        LOGW("hook target 0x%llx not found in maps, deny hook", (unsigned long long)target);
+        return false;
+    }
+    return writable;
+}
+
 static bool try_install_sensor_hook() {
     struct Cand { const char *lib; const char *sym; };
     static const Cand cands[] = {
@@ -1069,6 +1139,20 @@ static bool try_install_sensor_hook() {
         for (int i = 0; i < hooked_n; ++i) if (hooked[i] == fn) { dup = true; break; }
         if (dup) continue;
 
+        // 安全闸门：memfd 只有 ELF 文件头，缺 program header 时 dladdr 判不出宿主库；
+        // 这种情况下先按 maps 反查地址归属，确认落在可写私有映射里才继续。
+        if (!is_hook_addr_writable(fn)) {
+            char owner[128] = "unknown";
+            resolve_addr_owner((uintptr_t)fn, owner, sizeof(owner));
+            char msg[256];
+            snprintf(msg, sizeof(msg),
+                     "sym=%s target=%s not in writable private mapping, inline hook skipped",
+                     c.sym, owner);
+            record_conflict("hook-skip-readonly", msg);
+            LOGW("skip inline hook on read-only target: %s", msg);
+            continue;
+        }
+
         LOGI("sensor sym: %s @ %p (lib=%s)", c.sym, fn, c.lib ? c.lib : "default");
         if (inline_hook_abs(fn, kHookFns[slot], (void **)&g_origs[slot], slot, c.sym)) {
             LOGI("sensor inline hook[%d] installed via %s", slot, c.sym);
@@ -1087,9 +1171,43 @@ static bool try_install_sensor_hook() {
 }
 
 // ---------------------------------------------------------------------------
-// 从 /proc/self/maps 枚举所有已映射 .so 的唯一 (dev, ino)
-// 用于对全部库广播 PLT hook 注册，让 Zygisk 自行找有该符号 PLT 条目的库
+// 从 /proc/self/maps 枚举候选 .so 的唯一 (dev, ino)，供 PLT hook 注册。
+//
+// v1.3.5 安全修复：旧实现把 maps 里**每一个** .so 都丢给 pltHookRegister 广播，
+// 这段代码运行在 preAppSpecialize（即 zygote 进程上下文），zygote 里同时挂着
+// LSPosed / Zygisk Next 等模块的库，数百个 (dev, ino) 一起提交会让 Zygisk 的
+// 重定位改写规模失控，失败即 zygote 崩溃，表现为「装完模块重启后整机起不来、
+// 救砖模块介入并清空模块目录」。
+//
+// 现在只保留确实可能静态引用 ASensorEventQueue_getEvents 的库：
+//   - 白名单 basename：libandroid.so / libandroid_runtime.so / libsensor.so
+//     / libmonochrome.so / libwebviewchromium*.so
+//   - 排除一切 /data/adb/（root 模块自己的库）与 zygisk companion 进程库
+// 上限 kMaxPltCandidates，宁可少挂也不放大 zygote 的改写面。
 // ---------------------------------------------------------------------------
+static constexpr size_t kMaxPltCandidates = 8;
+
+static bool is_plt_candidate_path(const char *path) {
+    if (!path || !path[0]) return false;
+    if (strstr(path, "/data/adb/")) return false;
+    if (strstr(path, "zygisk")) return false;
+    if (strstr(path, "/stepspoof_joyrun/")) return false;
+
+    const char *slash = strrchr(path, '/');
+    const char *base = slash ? slash + 1 : path;
+    static const char *kAllowed[] = {
+        "libandroid.so",
+        "libandroid_runtime.so",
+        "libsensor.so",
+    };
+    for (const char *a : kAllowed) {
+        if (strcmp(base, a) == 0) return true;
+    }
+    if (strncmp(base, "libwebviewchromium", 18) == 0) return true;
+    if (strncmp(base, "libmonochrome", 13) == 0) return true;
+    return false;
+}
+
 static std::vector<std::pair<dev_t, ino_t>> get_all_mapped_sos() {
     std::vector<std::pair<dev_t, ino_t>> result;
     std::set<std::pair<dev_t, ino_t>> seen;
@@ -1104,22 +1222,33 @@ static std::vector<std::pair<dev_t, ino_t>> get_all_mapped_sos() {
     close(fd);
 
     size_t pos = 0;
+    size_t scanned = 0;
     while (pos < buf.size()) {
         size_t eol = buf.find('\n', pos);
         if (eol == std::string::npos) eol = buf.size();
         std::string line = buf.substr(pos, eol - pos);
         pos = eol + 1;
+        ++scanned;
 
         if (line.find(".so") == std::string::npos) continue;
 
+        // maps 行格式：addr perms offset dev inode pathname
+        const char *p = line.c_str();
+        const char *last_slash = strrchr(p, '/');
+        if (!is_plt_candidate_path(last_slash)) continue;
+
         unsigned int ma = 0, mi = 0;
         unsigned long long ino = 0;
-        if (sscanf(line.c_str(), "%*s %*s %*s %x:%x %llu", &ma, &mi, &ino) == 3 && ino != 0) {
+        if (sscanf(p, "%*s %*s %*s %x:%x %llu", &ma, &mi, &ino) == 3 && ino != 0) {
             auto key = std::make_pair(makedev(ma, mi), (ino_t)ino);
-            if (seen.insert(key).second) result.push_back(key);
+            if (seen.insert(key).second) {
+                result.push_back(key);
+                if (result.size() >= kMaxPltCandidates) break;
+            }
         }
     }
-    LOGI("maps: found %zu unique sos", result.size());
+    LOGI("maps: scanned %zu lines, %zu plt candidates (cap %zu)",
+         scanned, result.size(), kMaxPltCandidates);
     return result;
 }
 
@@ -1946,33 +2075,11 @@ public:
         load_config_from_dir(dir);
         if (dir >= 0) close(dir);
 
-        if (api) {
-            auto sos = get_all_mapped_sos();
-            for (auto &kv : sos) {
-                api->pltHookRegister(kv.first, kv.second,
-                                     "ASensorEventQueue_getEvents",
-                                     (void *)hook_get_events,
-                                     (void **)&g_orig_get_events);
-            }
-            if (api->pltHookCommit()) {
-                LOGI("sensor hook committed: %zu sos scanned orig=%p",
-                     sos.size(), (void *)g_orig_get_events);
-                if (g_orig_get_events != nullptr) {
-                    Dl_info dl {};
-                    if (dladdr((const void *)g_orig_get_events, &dl) && dl.dli_fname &&
-                        !strstr(dl.dli_fname, "libandroid.so") &&
-                        !strstr(dl.dli_fname, "libandroid_runtime.so") &&
-                        !strstr(dl.dli_fname, "libsensor.so")) {
-                        char msg[256];
-                        snprintf(msg, sizeof(msg), "ASensorEventQueue_getEvents PLT -> %s",
-                                 dl.dli_fname);
-                        record_conflict("plt-hook", msg);
-                    }
-                }
-            } else {
-                LOGE("pltHookCommit failed on all %zu sos", sos.size());
-            }
-        }
+        // v1.3.5 安全修复：这里**不做任何 PLT / inline hook**。
+        // preAppSpecialize 运行在 zygote 上下文，此处改写会导致整机起不来
+        // （见 get_all_mapped_sos 注释）。所有 hook 移到 postAppSpecialize，
+        // 等进程已经 specialize 成目标 App 之后再动手。
+        LOGI("preAppSpecialize done, hooks deferred to post stage (pid=%d)", getpid());
     }
 
     void postAppSpecialize(const zygisk::AppSpecializeArgs *) override {
@@ -2002,7 +2109,7 @@ public:
                  tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
 
         const DeviceInfo &dev = device_info();
-        LOGI("===== stepspoof_joyrun v1.3.5 start %s pid=%d main=%d uid=%d =====",
+        LOGI("===== stepspoof_joyrun v1.3.6 start %s pid=%d main=%d uid=%d =====",
              when, getpid(), is_main ? 1 : 0, (int)getuid());
         LOGI("device: %s | %s | %s", dev.name, dev.android, dev.abi);
         LOGI("device fingerprint: %s", dev.fp8);
@@ -2010,7 +2117,43 @@ public:
              dev.fp_full[0] ? dev.fp_full : "(unavailable)");
         LOGI("log file: %s", g_log_path[0] ? g_log_path : "(not opened yet)");
 
-        // PLT hook 没打上时，尝试 inline hook（Android 14+ 路径）
+        // ---- PLT hook（已 specialize 成目标 App 之后才注册）----
+        // Zygisk 的 Api 只能在 pre/postSpecialize 内使用，post 阶段仍然有效，
+        // 但此时 /proc/self/maps 是目标 App 自己的映射，规模正常。
+        if (api) {
+            auto sos = get_all_mapped_sos();
+            if (sos.empty()) {
+                LOGI("plt: no candidate sos, skip PLT hook");
+            } else {
+                for (auto &kv : sos) {
+                    api->pltHookRegister(kv.first, kv.second,
+                                         "ASensorEventQueue_getEvents",
+                                         (void *)hook_get_events,
+                                         (void **)&g_orig_get_events);
+                }
+                if (api->pltHookCommit()) {
+                    LOGI("sensor hook committed: %zu sos scanned orig=%p",
+                         sos.size(), (void *)g_orig_get_events);
+                    if (g_orig_get_events != nullptr) {
+                        Dl_info dl {};
+                        if (dladdr((const void *)g_orig_get_events, &dl) && dl.dli_fname &&
+                            !strstr(dl.dli_fname, "libandroid.so") &&
+                            !strstr(dl.dli_fname, "libandroid_runtime.so") &&
+                            !strstr(dl.dli_fname, "libsensor.so")) {
+                            char msg[256];
+                            snprintf(msg, sizeof(msg), "ASensorEventQueue_getEvents PLT -> %s",
+                                     dl.dli_fname);
+                            record_conflict("plt-hook", msg);
+                        }
+                    }
+                } else {
+                    LOGW("pltHookCommit returned false on %zu sos", sos.size());
+                }
+            }
+        }
+
+        // PLT hook 没打上时，尝试 inline hook（Android 14+ 路径）。
+        // 现在运行在目标 App 进程里，不是 zygote，改写范围受限。
         if (g_hook_cnt.load() == 0) {
             try_install_sensor_hook();
         }
