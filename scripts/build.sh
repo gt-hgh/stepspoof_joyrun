@@ -1,6 +1,5 @@
 #!/bin/bash
-# 在 WSL 中编译并打包 Zygisk 模块
-# 用法: bash build.sh
+# Build and package Zygisk module in WSL
 set -euo pipefail
 
 NDK="${ANDROID_NDK_R27D:-$HOME/android/android-ndk-r27d}"
@@ -8,13 +7,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$ROOT/build"
 DIST="$ROOT/dist"
 MODID="stepspoof_joyrun"
-VER="v1.3.6"
+VER="v1.3.8"
 
 echo "[*] NDK   = $NDK"
 echo "[*] ROOT  = $ROOT"
 
 if [ ! -x "$NDK/ndk-build" ]; then
-  echo "[!] ndk-build 不存在: $NDK/ndk-build"
+  echo "[!] ndk-build not found: $NDK/ndk-build"
   exit 1
 fi
 
@@ -31,7 +30,7 @@ mkdir -p "$OUT" "$DIST"
 
 SO="$OUT/libs/arm64-v8a/libstepspoof.so"
 if [ ! -f "$SO" ]; then
-  echo "[!] 编译失败，未找到 $SO"
+  echo "[!] build failed, $SO not found"
   exit 1
 fi
 echo "[*] built: $SO ($(stat -c%s "$SO") bytes)"
@@ -45,7 +44,7 @@ cp "$ROOT/META-INF/com/google/android/update-binary" "$STAGE/META-INF/com/google
 cp "$ROOT/META-INF/com/google/android/updater-script" "$STAGE/META-INF/com/google/android/"
 cp "$SO" "$STAGE/zygisk/arm64-v8a.so"
 
-# 开机脚本：把 user 0 的配置同步到应用双开（999 空间）
+# service.sh: sync user-0 config to user-999 on boot
 if [ -f "$ROOT/service.sh" ]; then
   cp "$ROOT/service.sh" "$STAGE/service.sh"
   chmod 0755 "$STAGE/service.sh"

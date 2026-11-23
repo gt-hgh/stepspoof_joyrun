@@ -10,7 +10,7 @@
 
 ## 说明
 
-闪动校园新版集成易盾加固，旧 LSPosed 方案会被检测退出。改用 native Zygisk 注入，hook `libsensor.so` 的 `read` 方法改写加速度数据。
+闪动校园新版集成易盾加固，旧 LSPosed 方案会被检测退出。改用 native Zygisk 注入，改写算法所需的加速度数据。
 
 ## 要求
 
@@ -61,6 +61,8 @@ device fingerprint full: Xiaomi/pearl/pearl:15/AQ3A.240812.001/V816.0.3.0:user/r
 
 ## 更新
 
+- **v1.3.8** 修复 hook 全部跳过的问题
+- **v1.3.7** 修复 v1.3.6 传感器 hook 全部装不上的问题：hook 安全判据从「映射当前可写」改为「能否 mprotect 成私有可写」
 - **v1.3.6** 修复 v1.3.5 装完重启后系统起不来的问题：hook 从 zygote 阶段移到目标 App 进程内；PLT 广播限制到 8 个候选库；inline hook 前先确认目标地址可写
 - **v1.3.5** 简化 WebUI 界面；一个控制台同步作用于主应用与双开应用；新增传感器冲突与外部修改监测
 - **v1.3.4** 日志头部带日期、设备名称与指纹

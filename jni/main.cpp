@@ -1,4 +1,4 @@
-// stepspoof_joyrun v1.3.6 — 纯 native Zygisk 模块
+﻿// stepspoof_joyrun v1.3.8 — 纯 native Zygisk 模块
 // 目标：com.huachenjie.shandong_school（闪动校园）
 // 功能：
 //   1) 加速度波形仿真（FuckRun 设计：X=0, Y=1.5·cos, Z=9.81+3.5·sin）
@@ -21,6 +21,13 @@
 //      v1.3.6 修复：preAppSpecialize 阶段不再做任何 hook（zygote 里做 PLT/inline
 //      改写会导致整机起不来，被救砖模块清空模块目录）；PLT 广播限制到 8 个候选库；
 //      inline hook 前必须确认目标地址在可写映射里。
+//      v1.3.7 修复：v1.3.6 的「可写映射」判据写错了——系统库 .text 恒为 r-xp，
+//      用它一票否决会让 8 场会话 24 次拒绝、0 次 hook 成功。判据改为「能否被本
+//      进程 mprotect 成私有可写」：拒绝共享映射(s)、放行私有映射(p)与系统库目录；
+//      真正的可写性交给 inline_hook_abs 里 mprotect 的返回值判定。
+//      同时 cmdline 仍是 usap64/zygote64 时打警告但不阻止 hook——USAP 机制下
+//      cmdline 更新晚于 postAppSpecialize，uid 已是目标 App、maps 已是私有映射，
+//      不等命名更新即可安全 hook；真正的安全守卫在 is_hook_addr_writable()。
 //   6) 本地 HTTP API（127.0.0.1:8888..8897）供 KSU WebUI 通过 root shell nc 访问
 //   7) conf_watch_loop：轮询 App 私有目录 stepspoof.conf，断连后持久化生效
 // 不依赖 LSPosed / 不建 ClassLoader / 不加载内存 dex。
@@ -366,10 +373,16 @@ static int64_t mono_ms() {
 // 本进程的 cmdline basename，比如 "com.huachenjie.shandong_school" 或
 // "com.huachenjie.shandong_school:push"。WebUI 的实例下拉框靠它区分
 // 同一个空间里被注入的多个进程——它们 uid 相同，只有进程名不同。
+static bool is_incubator_proc_name(const char *name);
+
 static const char *proc_name() {
     static char name[128] = {};
     static std::atomic<int> once{0};
-    if (once.exchange(1)) return name;
+    // v1.3.7：cmdline 在 postAppSpecialize 早期可能还是 usap64 / zygote64。
+    // 一旦缓存了这种孵化器名字，WebUI 实例列表会永远显示错的进程名，
+    // 所以只有在拿到「不是孵化器」的名字时才锁定缓存。
+    bool cached = once.load();
+    if (cached && name[0] && !is_incubator_proc_name(name)) return name;
     int fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
     if (fd >= 0) {
         char b[256] = {};
@@ -379,7 +392,15 @@ static const char *proc_name() {
             b[r] = 0;
             // cmdline 以 \0 分隔，第一个字段就是主 cmdline
             const char *slash = strrchr(b, '/');
-            snprintf(name, sizeof(name), "%s", slash ? slash + 1 : b);
+            const char *base = slash ? slash + 1 : b;
+            if (base[0] && !is_incubator_proc_name(base)) {
+                snprintf(name, sizeof(name), "%s", base);
+                once.store(1);
+            } else if (!name[0]) {
+                // 还没轮到真名：先存着用于日志，但不锁定缓存
+                snprintf(name, sizeof(name), "%s", base[0] ? base : TARGET_PKG);
+                return name;
+            }
         }
     }
     if (!name[0]) snprintf(name, sizeof(name), "%s", TARGET_PKG);
@@ -1038,15 +1059,22 @@ static bool inline_hook_abs(void *target_fn, void *hook_fn, void **orig_out,
 }
 
 // ---------------------------------------------------------------------------
-// inline hook 安全闸门（v1.3.5 安全修复）
+// inline hook 安全闸门（v1.3.7 修正判据）
 //
-// inline_hook_abs 会 mprotect + memcpy 改写目标函数入口。如果目标是
-// 系统只读映射（system_file 标签下的 libandroid.so / libandroid_runtime.so），
-// Android 14+ 的 SELinux 会拒绝，更糟的是部分 ROM 上改写失败却已改了半截，
-// 进程直接崩。所以在动手之前先确认这个地址落在可写的私有映射里：
-//   - /proc/self/maps 里该地址所在行的 perms 必须包含 'w'；
-//   - 或落在 app 私有路径（/data/app/、/data/data/、/data/user/）；
-//   - 或落在匿名可执行映射（inline hook 已装过一次的 trampoline 区）。
+// v1.3.6 版本这里是错的：它只认 perms 里的 'w'。可是目标永远是系统库的
+// .text 段，映射天然是 r-xp，sensor 一旦真的装上就恒等于「不可写」全拒——
+// 实测 v1.3.6 八场会话 24 次拒绝、0 次 inline_hook via mprotect，传感器
+// 注入全线失效。而 v1.3.4 之所以能装上，是 inline_hook_abs 自己会
+// mprotect 把 r-xp 临时改成 rwx、写完再改回 r-x，根本不需要映射本来就可写。
+//
+// 真正该问的是「这个地址能不能被本进程自己提升为可写」，判据改为：
+//   - 代码段：perms[0]=='r' 且 perms[2]=='x'；
+//   - 不得是共享映射：perms[3]=='s' 时拒绝（写下去会影响所有进程，
+//     mprotect 也做不到「本进程私有」）；
+//   - 私有映射 perms[3]=='p' 直接放行（mprotect 出来是本进程私有的副本）；
+//   - 无私有标志但 pathname 落在 /system/、/apex/、/vendor/ 的库也放行
+//     （Android 15 起系统库常是 MAP_SHARED 只读段，靠 memfd 式私有重映射）。
+// 是否最终真的能写，交给 inline_hook_abs 里 mprotect 的返回值判定。
 // ---------------------------------------------------------------------------
 static bool is_hook_addr_writable(const void *addr) {
     if (!addr) return false;
@@ -1076,26 +1104,53 @@ static bool is_hook_addr_writable(const void *addr) {
 
     size_t pos = 0;
     bool found = false;
-    bool writable = false;
+    bool allow = false;
     while (pos < buf.size()) {
         size_t eol = buf.find('\n', pos);
         if (eol == std::string::npos) eol = buf.size();
         const char *begin = buf.c_str() + pos;
-        const char *end = buf.c_str() + eol;
         pos = eol + 1;
 
         unsigned long long lo = 0, hi = 0;
         char perms[8] = {};
-        if (sscanf(begin, "%llx-%llx %7s", &lo, &hi, perms) != 3) continue;
+        char path[256] = {};
+        int got = sscanf(begin, "%llx-%llx %7s %*s %*s %*s %255s", &lo, &hi, perms, path);
+        if (got < 3) continue;
         if (target < lo || target >= hi) continue;
 
         found = true;
-        writable = (perms[1] == 'w');
-        if (!writable) {
-            LOGW("hook target 0x%llx in mapping %llx-%llx perms=%s (not writable)",
-                 (unsigned long long)target, lo, hi, perms);
+        const char *where = (got >= 4) ? path : "-";
+        bool is_shared = (perms[3] == 's');
+        bool is_private = (perms[3] == 'p');
+        bool is_code = (perms[0] == 'r' && perms[2] == 'x');
+
+        if (!is_code) {
+            LOGW("hook target 0x%llx perms=%s path=%s (not an executable code mapping), deny",
+                 (unsigned long long)target, perms, where);
+            break;
         }
-        (void)end;
+        if (is_shared) {
+            LOGW("hook target 0x%llx perms=%s path=%s (shared mapping, cannot privatize), deny",
+                 (unsigned long long)target, perms, where);
+            break;
+        }
+        if (is_private) {
+            allow = true;
+            LOGI("hook target 0x%llx perms=%s path=%s (private code mapping, mprotect allowed)",
+                 (unsigned long long)target, perms, where);
+            break;
+        }
+        // 既非 p 也非 s（极少数 ROM 会这样标）：只有系统库目录下的才放行
+        if (path[0] && (strncmp(path, "/system/", 8) == 0 ||
+                        strncmp(path, "/apex/", 6) == 0 ||
+                        strncmp(path, "/vendor/", 8) == 0)) {
+            allow = true;
+            LOGI("hook target 0x%llx perms=%s path=%s (system lib, mprotect allowed)",
+                 (unsigned long long)target, perms, where);
+            break;
+        }
+        LOGW("hook target 0x%llx perms=%s path=%s (unknown mapping flags), deny",
+             (unsigned long long)target, perms, where);
         break;
     }
 
@@ -1103,7 +1158,7 @@ static bool is_hook_addr_writable(const void *addr) {
         LOGW("hook target 0x%llx not found in maps, deny hook", (unsigned long long)target);
         return false;
     }
-    return writable;
+    return allow;
 }
 
 static bool try_install_sensor_hook() {
@@ -1139,17 +1194,19 @@ static bool try_install_sensor_hook() {
         for (int i = 0; i < hooked_n; ++i) if (hooked[i] == fn) { dup = true; break; }
         if (dup) continue;
 
-        // 安全闸门：memfd 只有 ELF 文件头，缺 program header 时 dladdr 判不出宿主库；
-        // 这种情况下先按 maps 反查地址归属，确认落在可写私有映射里才继续。
+        // 安全闸门（v1.3.7）：这里只做「明显不可做」的快速失败——目标不是代码段、
+        // 是共享映射、或压根不在 maps 里。真正「能不能写」交给 inline_hook_abs 里
+        // mprotect 的返回值判定，绝不能用「当前是否可写」一票否决，因为系统库的
+        // .text 恒为 r-xp，那样会把所有候选全部拦死（v1.3.6 的回归就是这么来的）。
         if (!is_hook_addr_writable(fn)) {
             char owner[128] = "unknown";
             resolve_addr_owner((uintptr_t)fn, owner, sizeof(owner));
             char msg[256];
             snprintf(msg, sizeof(msg),
-                     "sym=%s target=%s not in writable private mapping, inline hook skipped",
+                     "sym=%s target=%s rejected by hook safety gate, inline hook skipped",
                      c.sym, owner);
-            record_conflict("hook-skip-readonly", msg);
-            LOGW("skip inline hook on read-only target: %s", msg);
+            record_conflict("hook-skip-unsafe", msg);
+            LOGW("skip inline hook on unsafe target: %s", msg);
             continue;
         }
 
@@ -2035,6 +2092,48 @@ static void webui_loop() {
 }
 
 // ---------------------------------------------------------------------------
+// v1.3.7 防误伤：判断自己是不是「还不是目标 App 本体」的孵化进程。
+//
+// postAppSpecialize 里读 /proc/self/cmdline 有时还是 usap64 / zygote64
+// （实测 2026-11-20 p15611 proc=usap64、p18432 proc=zygote64），说明进程名
+// 尚未更新；这种进程里的 libsensor.so 是 zygote 继承来的共享映射，改它既
+// 没意义又会波及后续 fork 出去的所有进程。这里返回 true 就让调用方等一等。
+// ---------------------------------------------------------------------------
+static bool is_incubator_proc_name(const char *name) {
+    if (!name || !name[0]) return false;
+    if (!strcmp(name, "zygote64") || !strcmp(name, "zygote")) return true;
+    if (!strcmp(name, "usap64") || !strcmp(name, "usap32")) return true;
+    if (!strcmp(name, "webview_zygote")) return true;
+    return false;
+}
+
+// 等到 cmdline 变成目标包名再返回 true，最长等约 400ms。等不到就返回 false，
+// 由调用方决定是照旧动手还是跳过 hook。
+static bool wait_for_app_cmdline() {
+    for (int i = 0; i < 8; i++) {
+        int fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+        char b[256] = {};
+        ssize_t r = -1;
+        if (fd >= 0) {
+            r = read(fd, b, sizeof(b) - 1);
+            close(fd);
+        }
+        if (r > 0) {
+            b[r] = 0;
+            const char *slash = strrchr(b, '/');
+            const char *base = slash ? slash + 1 : b;
+            if (base[0] && !is_incubator_proc_name(base)) {
+                if (i > 0) LOGI("cmdline settled to %s after %d ms", base, i * 50);
+                return true;
+            }
+        }
+        usleep(50 * 1000);
+    }
+    LOGW("cmdline still incubator-like (%s) after 400ms", proc_name());
+    return false;
+}
+
+// ---------------------------------------------------------------------------
 // Zygisk 模块
 // ---------------------------------------------------------------------------
 class StepSpoofModule : public zygisk::ModuleBase {
@@ -2095,6 +2194,10 @@ public:
         // 先按目标进程真实 uid 解析私有目录（区分 user 0 与双开空间）
         init_ctl_paths();
 
+        // v1.3.7 防误伤：此时 cmdline 可能还是 usap64 / zygote64，进程名没更新，
+        // maps 也是 zygote 继承的共享只读映射。等它变成真正的 App 进程名再往下走。
+        bool cmdline_ok = wait_for_app_cmdline();
+
         // 首个日志落盘，附带一次环境快照，便于他人排障。
         // 时间戳带日期（行内时间戳只有时分秒，跨天无法定位是哪一天）；
         // 再跟设备名称与指纹，多台设备的日志才不会互相混淆。
@@ -2109,7 +2212,7 @@ public:
                  tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
 
         const DeviceInfo &dev = device_info();
-        LOGI("===== stepspoof_joyrun v1.3.6 start %s pid=%d main=%d uid=%d =====",
+        LOGI("===== stepspoof_joyrun v1.3.8 start %s pid=%d main=%d uid=%d =====",
              when, getpid(), is_main ? 1 : 0, (int)getuid());
         LOGI("device: %s | %s | %s", dev.name, dev.android, dev.abi);
         LOGI("device fingerprint: %s", dev.fp8);
@@ -2153,7 +2256,16 @@ public:
         }
 
         // PLT hook 没打上时，尝试 inline hook（Android 14+ 路径）。
-        // 现在运行在目标 App 进程里，不是 zygote，改写范围受限。
+        // 现在运行在目标 App 进程里（uid=%d，不是 zygote），改写范围受限。
+        // v1.3.8：不再以 cmdline 是否更新作为 hook 的门卫。
+        //   - USAP 进程在 postAppSpecialize 时 uid 已经切换、maps 已经是 App 的私有映射，
+        //     但 prctl(PR_SET_NAME) 在 Java 层才跑，cmdline 更新晚于本回调；
+        //   - 真正的安全守卫是 is_hook_addr_writable()：只有 perms[3]=='p'（私有映射）
+        //     或系统库路径才允许 mprotect，这个检查现在是正确的。
+        if (!cmdline_ok) {
+            LOGW("cmdline still incubator-like (%s), proceeding with hook anyway (uid=%d)",
+                 proc_name(), (int)getuid());
+        }
         if (g_hook_cnt.load() == 0) {
             try_install_sensor_hook();
         }
